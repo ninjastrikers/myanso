@@ -113,6 +113,20 @@
       min-width: 0;
     }
 
+    /* Inline title editor — matches the label's box so the tab doesn't jump. */
+    .tab .tab-title-input {
+      flex: 1 1 auto;
+      min-width: 0;
+      margin: 0;
+      padding: 0 2px;
+      border: none;
+      border-radius: 3px;
+      background: var(--control-bg, rgba(255, 255, 255, 0.08));
+      color: var(--panel-fg, #e4e4e4);
+      font: inherit;
+      outline: 1px solid var(--accent, #4c8bf5);
+    }
+
     .tab:hover {
       background: var(--control-bg, rgba(255, 255, 255, 0.04));
     }
@@ -670,6 +684,59 @@
       height: 1px;
       margin: 6px 8px;
       background: var(--panel-border, #2a2d38);
+    }
+
+    /* Tab color swatch row in the tab context menu. */
+    .pane-menu-colors {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 7px;
+      padding: 5px 10px 7px;
+      max-width: 210px;
+    }
+
+    .tab-swatch {
+      position: relative;
+      width: 18px;
+      height: 18px;
+      border-radius: 50%;
+      cursor: pointer;
+      box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.18);
+    }
+
+    .tab-swatch:hover {
+      transform: scale(1.12);
+    }
+
+    .tab-swatch.sel {
+      box-shadow: 0 0 0 2px var(--chrome-top, #1e2029), 0 0 0 4px var(--accent, #4c8bf5);
+    }
+
+    /* "No color" — a slashed empty ring. */
+    .tab-swatch.none {
+      background:
+        linear-gradient(to bottom right, transparent 45%, #e06c75 45%, #e06c75 55%, transparent 55%),
+        var(--control-bg, rgba(255, 255, 255, 0.08));
+    }
+
+    /* iTerm-style colored tab: subtle background tint + a solid underline in the
+       tab's color. Tint strength differs for the active vs inactive tab. */
+    .tab.colored {
+      box-shadow: inset 0 -2px 0 var(--tab-color);
+    }
+
+    .tab.colored:not(.active) {
+      background: color-mix(in srgb, var(--tab-color) 14%, transparent);
+    }
+
+    .tab.colored.active {
+      background: color-mix(in srgb, var(--tab-color) 24%, var(--tab-bg-active, #15171e));
+    }
+
+    /* Hover only brightens an INACTIVE colored tab; the active tab keeps its
+       stronger 24% tint (scoped so it doesn't override .tab.colored.active). */
+    .tab.colored:not(.active):hover {
+      background: color-mix(in srgb, var(--tab-color) 20%, var(--tab-bg-active, #15171e));
     }
   </style>
 </head>

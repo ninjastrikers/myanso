@@ -521,7 +521,7 @@ const SPACINGS = {
   presentation: { name: 'Presentation', value: 2.0 }
 };
 
-// မြန်မာည် — sample Myanmar text for the settings preview.
+// မြန်မာ — sample Myanmar text for the settings preview.
 const PREVIEW_MYANMAR = '\u1019\u1004\u103A\u1039\u1002\u101C\u102C\u1015\u102B ';
 
 const DEFAULTS = { theme: DEFAULT_THEME, font: IS_WIN ? 'cascadia' : 'menlo', customFont: '', fontSize: 14, spacing: 'normal' };
@@ -636,10 +636,10 @@ function renderPreview() {
 // isMyanmarNonspacing = just the Mn (non-spacing) subset.
 function isMyanmarMark(c) {
   return (c >= 0x102b && c <= 0x103e) || (c >= 0x1056 && c <= 0x1059) ||
-         (c >= 0x105e && c <= 0x1060) || (c >= 0x1062 && c <= 0x1064) ||
-         (c >= 0x1067 && c <= 0x106d) || (c >= 0x1071 && c <= 0x1074) ||
-         (c >= 0x1082 && c <= 0x108d) || c === 0x108f ||
-         (c >= 0x109a && c <= 0x109d);
+    (c >= 0x105e && c <= 0x1060) || (c >= 0x1062 && c <= 0x1064) ||
+    (c >= 0x1067 && c <= 0x106d) || (c >= 0x1071 && c <= 0x1074) ||
+    (c >= 0x1082 && c <= 0x108d) || c === 0x108f ||
+    (c >= 0x109a && c <= 0x109d);
 }
 
 // Myanmar non-spacing marks (general category Mn) — width 0 in standard wcwidth.
@@ -649,10 +649,10 @@ function isMyanmarMark(c) {
 // ◌်-ending syllable — hence this explicit Mn list instead of trusting base.
 function isMyanmarNonspacing(c) {
   return (c >= 0x102d && c <= 0x1030) || (c >= 0x1032 && c <= 0x1037) ||
-         c === 0x1039 || c === 0x103a || c === 0x103d || c === 0x103e ||
-         (c >= 0x1058 && c <= 0x1059) || (c >= 0x105e && c <= 0x1060) ||
-         (c >= 0x1071 && c <= 0x1074) || c === 0x1082 ||
-         (c >= 0x1085 && c <= 0x1086) || c === 0x108d || c === 0x109d;
+    c === 0x1039 || c === 0x103a || c === 0x103d || c === 0x103e ||
+    (c >= 0x1058 && c <= 0x1059) || (c >= 0x105e && c <= 0x1060) ||
+    (c >= 0x1071 && c <= 0x1074) || c === 0x1082 ||
+    (c >= 0x1085 && c <= 0x1086) || c === 0x108d || c === 0x109d;
 }
 
 // Pack a width into xterm's charProperties value, joining a width-0 mark onto the
@@ -1085,27 +1085,143 @@ function setActivePane(pane) {
 function activePaneOf(tab) {
   return panesByPtyId.get(tab.activePtyId) || leavesOf(tab.root)[0];
 }
-// Full, untruncated name — used for the tooltip and the OS window title.
-function tabFullName(tab) {
+// The app-driven name (OSC title → cwd basename → "shell"), ignoring any custom
+// title. This is the fallback shown when no custom title is set, and the
+// placeholder in the rename editor.
+function appTabName(tab) {
   const p = activePaneOf(tab);
   if (!p) return 'shell';
   return p.title || basename(p.cwd) || 'shell';
 }
-// Short label shown in the (narrow) tab. Shell titles are often the whole path
-// (user@host:~/a/b/c); keep only the last segment ("c"). Plain titles set by
-// TUIs (e.g. "vim") have no "/" and pass through unchanged.
+// Full, untruncated name — used for the tooltip and the OS window title.
+// A user-set custom title (via right-click → Edit Title) wins over the app's
+// own title and cwd; clearing it (empty string) falls back to the app name.
+function tabFullName(tab) {
+  return tab.customTitle || appTabName(tab);
+}
+// Short label shown in the (narrow) tab. A custom title is shown verbatim; an
+// app name that is a full path (user@host:~/a/b/c) is trimmed to its last
+// segment ("c"). Plain TUI titles (e.g. "vim") have no "/" and pass through.
 function tabDisplayName(tab) {
-  const full = tabFullName(tab);
+  if (tab.customTitle) return tab.customTitle;
+  const full = appTabName(tab);
   return /[/\\]/.test(full) ? (basename(full) || full) : full;
 }
 function refreshTabTitle(tab) {
-  if (tab.titleEl) tab.titleEl.textContent = tabDisplayName(tab);
+  // Skip the label while it is an <input> (rename in progress) — the editor owns
+  // it and restores the span on commit.
+  if (tab.titleEl && tab.titleEl.tagName !== 'INPUT') tab.titleEl.textContent = tabDisplayName(tab);
   if (tab.btnEl) tab.btnEl.title = tabFullName(tab);
   if (tab === currentTab) document.title = tabFullName(tab);
 }
 function onPaneTitleChanged(pane) {
   const tab = tabs.find((x) => x.id === pane.tabId);
   if (tab && tab.activePtyId === pane.ptyId) refreshTabTitle(tab);
+}
+
+// Set (or clear, with '') a tab's user-chosen title. A non-empty title pins the
+// tab name so pane OSC-title / cwd updates no longer change it; '' restores the
+// app-driven name.
+function setTabCustomTitle(tab, title) {
+  const t = (title || '').trim();
+  tab.customTitle = t || undefined;
+  refreshTabTitle(tab);
+}
+
+// iTerm-style tab colors. A fixed preset palette shown in the tab context menu.
+// Falsy color = no tint (default).
+const TAB_COLORS = [
+  { name: 'Red', value: '#e06c75' },
+  { name: 'Orange', value: '#e0954c' },
+  { name: 'Yellow', value: '#e5c07b' },
+  { name: 'Green', value: '#98c379' },
+  { name: 'Blue', value: '#61afef' },
+  { name: 'Purple', value: '#c678dd' },
+  { name: 'Pink', value: '#e688b8' }
+];
+
+// Paint the tab's element from tab.color. The tint (background + underline) is
+// done in CSS via the .colored class + the --tab-color custom property, so the
+// theme's active/inactive backgrounds still show through (see index.html).
+function applyTabColor(tab) {
+  const el = tab.btnEl;
+  if (!el) return;
+  if (tab.color) {
+    el.style.setProperty('--tab-color', tab.color);
+    el.classList.add('colored');
+  } else {
+    el.style.removeProperty('--tab-color');
+    el.classList.remove('colored');
+  }
+}
+
+// Set (or clear, with falsy) a tab's color. Persists for the tab's lifetime and
+// across a cross-window move (see buildTabDescriptor / adoptTab).
+function setTabColor(tab, color) {
+  tab.color = color || undefined;
+  applyTabColor(tab);
+}
+
+// The rename in progress, or null: { tab, input, finish }. Module-level so any
+// code that is about to rebuild/replace the tab bar can commit it first (see
+// commitTitleEdit), which is what makes the edit survive an unrelated
+// renderTabBar() or a click onto another tab instead of being silently dropped.
+let activeTitleEdit = null;
+
+// Commit any in-progress rename now (no-op if none). Call before tearing down or
+// rebuilding the tab bar so the typed title is saved rather than lost.
+function commitTitleEdit() {
+  if (activeTitleEdit) activeTitleEdit.finish(true);
+}
+
+// Inline-edit a tab's title: swap its label for an <input>, seeded with the
+// current custom title (blank if none — placeholder shows the app name). Enter /
+// blur commits, Escape cancels. Committing empty clears the custom title. The
+// label span is restored in place on finish (no full tab-bar rebuild).
+function startTabTitleEdit(tab) {
+  if (activeTitleEdit) {
+    // Already editing: refocus if it's the same tab, else commit the other first.
+    if (activeTitleEdit.tab === tab) { activeTitleEdit.input.focus(); activeTitleEdit.input.select(); return; }
+    activeTitleEdit.finish(true);
+  }
+  const label = tab.titleEl;
+  if (!label) return;
+  const input = document.createElement('input');
+  input.className = 'tab-title-input';
+  input.value = tab.customTitle || '';
+  input.placeholder = appTabName(tab);   // the name it falls back to when cleared
+  label.replaceWith(input);
+  tab.titleEl = input;
+  input.focus();
+  input.select();
+
+  let done = false;
+  const finish = (commit) => {
+    if (done) return;
+    done = true;
+    if (activeTitleEdit && activeTitleEdit.input === input) activeTitleEdit = null;
+    if (commit) {
+      const t = input.value.trim();
+      tab.customTitle = t || undefined;
+    }
+    // Restore the label span in place (cheaper than a full renderTabBar, and it
+    // preserves the tab element so focus/drag state isn't churned).
+    const span = document.createElement('span');
+    tab.titleEl = span;
+    input.replaceWith(span);
+    refreshTabTitle(tab);
+  };
+  activeTitleEdit = { tab, input, finish };
+  input.addEventListener('keydown', (e) => {
+    e.stopPropagation();
+    if (e.key === 'Enter') { e.preventDefault(); finish(true); }
+    else if (e.key === 'Escape') { e.preventDefault(); finish(false); }
+  });
+  // Don't let a click/double-click inside the input start a tab drag, select the
+  // tab, or bubble to the tab's dblclick handler and re-open the editor.
+  input.addEventListener('mousedown', (e) => e.stopPropagation());
+  input.addEventListener('dblclick', (e) => e.stopPropagation());
+  input.addEventListener('blur', () => finish(true));
 }
 
 function focusPane(pane) {
@@ -1165,7 +1281,7 @@ function attachDivider(divider, container, node, wrapA, wrapB) {
     const onMove = (ev) => {
       const rect = container.getBoundingClientRect();
       let r = horiz ? (ev.clientX - rect.left) / rect.width
-                    : (ev.clientY - rect.top) / rect.height;
+        : (ev.clientY - rect.top) / rect.height;
       r = Math.max(0.1, Math.min(0.9, r));
       node.ratio = r;
       wrapA.style.flex = `${r} 1 0`;
@@ -1293,16 +1409,23 @@ function newTab(cwd) {
 }
 
 function selectTab(tab) {
+  commitTitleEdit();  // clicking away from a rename commits it, not loses it
   currentTab = tab;
-  for (const t of tabs) t.el.style.display = t === tab ? 'flex' : 'none';
-  renderTabBar();
+  // Toggle visibility + active state IN PLACE (no bar rebuild) so a double-click
+  // to rename isn't defeated by the tab element being destroyed between clicks.
+  for (const t of tabs) {
+    t.el.style.display = t === tab ? 'flex' : 'none';
+    if (t.btnEl) t.btnEl.classList.toggle('active', t === tab);
+  }
   refreshTabTitle(tab); // update the window title bar for the shown tab
   // Re-focus the tab's last-active pane (or its first).
   const pane = panesByPtyId.get(tab.activePtyId) || leavesOf(tab.root)[0];
   // Defer so the now-visible panes get measured before fitting/focusing.
   requestAnimationFrame(() => {
     leavesOf(tab.root).forEach(fitPane);
-    if (pane) focusPane(pane);
+    // Don't steal focus into the terminal if a rename editor just opened (e.g.
+    // a double-click, whose mousedowns scheduled this rAF before the editor).
+    if (pane && !activeTitleEdit) focusPane(pane);
   });
 }
 
@@ -1317,11 +1440,10 @@ function closeTab(tab) {
     ipcRenderer.send('close-window');
     return;
   }
-  if (currentTab === tab) {
-    selectTab(tabs[Math.min(idx, tabs.length - 1)]);
-  } else {
-    renderTabBar();
-  }
+  // A tab was removed → rebuild the bar structure, then re-select if the closed
+  // tab was the active one (selectTab only toggles active state in place now).
+  renderTabBar();
+  if (currentTab === tab) selectTab(tabs[Math.min(idx, tabs.length - 1)]);
 }
 
 // --- Moving a tab between windows -------------------------------------------
@@ -1341,6 +1463,8 @@ function buildTabDescriptor(tab) {
   return {
     tabId: tab.id,
     title: tabDisplayName(tab),
+    customTitle: tab.customTitle,
+    color: tab.color,
     tree: serializeNode(tab.root),
     ptyIds: leavesOf(tab.root).map((p) => p.ptyId)
   };
@@ -1356,7 +1480,7 @@ function rebuildTree(descNode, tabId) {
 
 // Build a tab in THIS window from a descriptor moved in from another window.
 function adoptTab(descriptor) {
-  const tab = { id: nextId('tab'), el: document.createElement('div'), root: null, activePtyId: null };
+  const tab = { id: nextId('tab'), el: document.createElement('div'), root: null, activePtyId: null, customTitle: descriptor.customTitle || undefined, color: descriptor.color || undefined };
   tab.el.className = 'tab-pane-area';
   document.getElementById('panes').appendChild(tab.el);
   tab.root = rebuildTree(descriptor.tree, tab.id);
@@ -1381,8 +1505,8 @@ function removeTabKeepPtys(tabId) {
   const idx = tabs.indexOf(tab);
   tabs.splice(idx, 1);
   if (tabs.length === 0) { ipcRenderer.send('close-window'); return; }
+  renderTabBar();
   if (currentTab === tab) selectTab(tabs[Math.min(idx, tabs.length - 1)]);
-  else renderTabBar();
 }
 
 // Start a custom drag when a tab is pressed and the cursor moves past a small
@@ -1423,6 +1547,7 @@ function startTabDrag(tab, downEvent) {
 }
 
 function renderTabBar() {
+  commitTitleEdit();  // save any in-progress rename before we discard its <input>
   const bar = document.getElementById('tabbar');
   bar.innerHTML = '';
   tabs.forEach((tab) => {
@@ -1435,6 +1560,7 @@ function renderTabBar() {
     el.title = tabFullName(tab);
     tab.titleEl = label;   // refreshTabTitle() updates these in place
     tab.btnEl = el;
+    applyTabColor(tab);    // restore any iTerm-style tab color onto the new el
 
     const close = document.createElement('span');
     close.className = 'close';
@@ -1452,7 +1578,13 @@ function renderTabBar() {
       selectTab(tab);
       startTabDrag(tab, e);
     });
-    // Right-click on tab → context menu (Close / Close Other Tabs).
+    // Double-click the tab (not the close button) → edit its title inline.
+    el.addEventListener('dblclick', (e) => {
+      if (e.target === close) return;
+      e.preventDefault();
+      startTabTitleEdit(tab);
+    });
+    // Right-click on tab → context menu (Edit / Reset Title, Close, …).
     el.addEventListener('contextmenu', (e) => {
       e.preventDefault();
       e.stopPropagation();
@@ -1517,7 +1649,9 @@ const MENU_ICONS = {
   'split-down': '<rect x="3" y="4" width="13" height="11" rx="2"/><rect x="3" y="10" width="13" height="5" rx="2" fill="currentColor" stroke="none"/>',
   'split-up': '<rect x="3" y="4" width="13" height="11" rx="2"/><rect x="3" y="4" width="13" height="5" rx="2" fill="currentColor" stroke="none"/>',
   close: '<line x1="5" y1="5" x2="14" y2="14"/><line x1="14" y1="5" x2="5" y2="14"/>',
-  'close-others': '<rect x="3" y="4" width="13" height="11" rx="2"/><line x1="7" y1="8" x2="12" y2="8"/><line x1="7" y1="11" x2="12" y2="11"/>'
+  'close-others': '<rect x="3" y="4" width="13" height="11" rx="2"/><line x1="7" y1="8" x2="12" y2="8"/><line x1="7" y1="11" x2="12" y2="11"/>',
+  rename: '<path d="M12 3l4 4-8 8H4v-4z"/><line x1="10" y1="5" x2="14" y2="9"/>',
+  reset: '<path d="M4 9a6 6 0 1 1 1.8 4.3"/><polyline points="3 5 4 9 8 8"/>'
 };
 const svgIcon = (name) =>
   '<svg class="pane-menu-icon" viewBox="0 0 19 19" fill="none" stroke="currentColor" stroke-width="1.4">' +
@@ -1527,9 +1661,51 @@ let paneMenuEl = null;
 function hidePaneMenu() {
   if (paneMenuEl) { paneMenuEl.remove(); paneMenuEl = null; }
 }
+// A menu row of color swatches: "none" plus the preset palette. Clicking a
+// swatch sets tab.color and closes the menu.
+function buildTabColorRow(tab) {
+  const wrap = document.createElement('div');
+  wrap.className = 'pane-menu-colors';
+
+  const mkSwatch = (color, title, extraClass) => {
+    const s = document.createElement('div');
+    s.className = 'tab-swatch' + (extraClass ? ' ' + extraClass : '');
+    if (color) s.style.background = color;
+    s.title = title;
+    if ((tab.color || '').toLowerCase() === (color || '').toLowerCase()) s.classList.add('sel');
+    return s;
+  };
+
+  // "No color" swatch (a slashed ring).
+  const none = mkSwatch('', 'No Color', 'none');
+  none.addEventListener('mousedown', (e) => {
+    e.preventDefault(); e.stopPropagation();
+    setTabColor(tab, ''); hidePaneMenu();
+  });
+  wrap.appendChild(none);
+
+  for (const c of TAB_COLORS) {
+    const s = mkSwatch(c.value, c.name);
+    s.addEventListener('mousedown', (e) => {
+      e.preventDefault(); e.stopPropagation();
+      setTabColor(tab, c.value); hidePaneMenu();
+    });
+    wrap.appendChild(s);
+  }
+
+  return wrap;
+}
+
 function showTabMenu(x, y, tab) {
   hidePaneMenu();
   const items = [];
+  items.push({ label: 'Edit Title', icon: 'rename', action: () => startTabTitleEdit(tab) });
+  if (tab.customTitle) {
+    items.push({ label: 'Reset Title', icon: 'reset', action: () => setTabCustomTitle(tab, '') });
+  }
+  items.push({ sep: true });
+  items.push({ render: () => buildTabColorRow(tab) });
+  items.push({ sep: true });
   items.push({ label: 'Close', icon: 'close', action: () => closeTab(tab) });
   if (tabs.length > 1) {
     items.push({ label: 'Close Other Tabs', icon: 'close-others', action: () => closeOtherTabs(tab) });
@@ -1542,6 +1718,10 @@ function showTabMenu(x, y, tab) {
       const s = document.createElement('div');
       s.className = 'pane-menu-sep';
       menu.appendChild(s);
+      continue;
+    }
+    if (it.render) {
+      menu.appendChild(it.render());
       continue;
     }
     const row = document.createElement('div');
@@ -1578,6 +1758,7 @@ function closeOtherTabs(keepTab) {
   for (let i = tabs.length - 1; i >= 0; i--) {
     if (tabs[i] !== keepTab) tabs.splice(i, 1);
   }
+  renderTabBar();  // drop the closed tabs' buttons, then mark keepTab active
   selectTab(keepTab);
 }
 
@@ -1600,6 +1781,10 @@ function showPaneMenu(x, y, pane) {
       const s = document.createElement('div');
       s.className = 'pane-menu-sep';
       menu.appendChild(s);
+      continue;
+    }
+    if (it.render) {
+      menu.appendChild(it.render());
       continue;
     }
     const row = document.createElement('div');
