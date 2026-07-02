@@ -1,4 +1,4 @@
-const { app, BrowserWindow, ipcMain, Menu, screen, nativeImage } = require('electron');
+const { app, BrowserWindow, ipcMain, Menu, screen, nativeImage, dialog } = require('electron');
 const path = require('path');
 const fs = require('fs');
 const os = require('os');
@@ -151,6 +151,7 @@ let widCounter = 0;              // logical per-window id, only for unique pty-i
 const tabCounts = new Map();     // BrowserWindow.id -> tab count (drives "Go to Tab N")
 const pendingAdopt = new Map();  // BrowserWindow.id -> callback to run once its renderer is ready
 let quitting = false;            // set in before-quit to guard pollPtyProcesses
+let readyToQuit = false;         // set once the user confirms quitting a busy app
 
 function ownerWindow(id) {
   const rec = ptys.get(id);
@@ -217,6 +218,80 @@ function pollPtyProcesses() {
     }
     reportPtyProcess(id, rec, raw);
   }
+}
+
+// --- "A process is still running" confirm-before-close ----------------------
+// A pty is "busy" when its foreground process (rec.lastProcess, tracked by
+// pollPtyProcesses) is a program other than the plain shell — e.g. Claude Code
+// still loading. Closing it then asks first so a stray Cmd+W / × / red-button
+// doesn't kill a running app. Detection lives here (not the renderer) so ALL
+// close paths — per-pane, per-tab, OS window close, and Cmd+Q — go through it,
+// and the native dialog is async so it never freezes the renderer's terminals.
+const SHELL_FG = /^-?(zsh|bash|fish|dash|sh|ksh|tcsh|csh|pwsh|powershell)(\.exe)?$/;
+function baseName(p) {
+  const parts = String(p).split(/[\\/]/);
+  return parts[parts.length - 1] || String(p);
+}
+// Returns a short program name to show the user, or null when the pty is idle
+// (a plain shell, or its foreground isn't known yet).
+function busyLabel(name) {
+  const fg = (name || '').toLowerCase();
+  if (fg === '' || SHELL_FG.test(fg)) return null;
+  let raw = String(name);
+  if (raw.startsWith('node:')) {
+    // 'node:<pid> <node-path> <script-path> <args…>' (from resolveNodeCmd).
+    // Show the script's basename, not a trailing flag: drop the pid + flags,
+    // then the last token that isn't node itself.
+    raw = raw.slice(5).replace(/^\d+\s+/, '');
+    const tokens = raw.split(/\s+/).filter((t) => t && !t.startsWith('-'));
+    raw = [...tokens].reverse().find((t) => baseName(t).toLowerCase() !== 'node')
+      || tokens[0] || 'node';
+  }
+  return baseName(raw) || 'a process';
+}
+function busyLabelsForPtyIds(ids) {
+  const out = [];
+  for (const id of ids || []) {
+    const rec = ptys.get(id);
+    const label = rec && busyLabel(rec.lastProcess);
+    if (label) out.push(label);
+  }
+  return out;
+}
+function busyLabelsForWindow(winId) {
+  const out = [];
+  for (const [, rec] of ptys) {
+    if (rec.ownerWinId !== winId) continue;
+    const label = busyLabel(rec.lastProcess);
+    if (label) out.push(label);
+  }
+  return out;
+}
+function allBusyLabels() {
+  const out = [];
+  for (const [, rec] of ptys) {
+    const label = busyLabel(rec.lastProcess);
+    if (label) out.push(label);
+  }
+  return out;
+}
+// Shows the native "still running" prompt. Returns true if the user confirmed
+// the destructive action (the button named `verb`), false to cancel.
+async function confirmBusyClose(win, labels, verb) {
+  const names = [...new Set(labels)].join(', ');
+  const opts = {
+    type: 'warning',
+    buttons: [verb, 'Cancel'],
+    defaultId: 1,           // Cancel is the safe default (Enter cancels)
+    cancelId: 1,
+    message: 'A process is still running.',
+    detail: `${names}\n\n${verb} anyway?`,
+    noLink: true,
+  };
+  const { response } = (win && !win.isDestroyed())
+    ? await dialog.showMessageBox(win, opts)
+    : await dialog.showMessageBox(opts);
+  return response === 0;
 }
 
 function spawnPty(id, cols, rows, cwd, ownerWinId) {
@@ -348,6 +423,19 @@ function createWindow(pos, initialDir, opts) {
 
   // Keep "Go to Tab N" in sync with whichever window is focused.
   win.on('focus', () => buildMenu());
+
+  // Intercept OS window close (red traffic light / Alt+F4) and the close-window
+  // IPC so a busy pane isn't killed without asking. Async: preventDefault holds
+  // the close, then re-issue win.close() once the user confirms.
+  win.on('close', (e) => {
+    if (win._readyToClose) return;
+    const labels = busyLabelsForWindow(win.id);
+    if (labels.length === 0) return;
+    e.preventDefault();
+    confirmBusyClose(win, labels, 'Close').then((ok) => {
+      if (ok && !win.isDestroyed()) { win._readyToClose = true; win.close(); }
+    });
+  });
 
   win.on('closed', () => {
     // Kill only the ptys this window still owns (moved-away tabs were repointed).
@@ -481,6 +569,14 @@ function setupIpc() {
   ipcMain.on('close-window', (event) => {
     const w = BrowserWindow.fromWebContents(event.sender);
     if (w && !w.isDestroyed()) w.close();
+  });
+
+  // Renderer asks before closing a pane/tab: reply whether it's OK to proceed
+  // (no busy pty, or the user confirmed the prompt).
+  ipcMain.handle('confirm-close-ptys', async (event, { ptyIds }) => {
+    const labels = busyLabelsForPtyIds(ptyIds);
+    if (labels.length === 0) return true;
+    return confirmBusyClose(BrowserWindow.fromWebContents(event.sender), labels, 'Close');
   });
 
   // The target finished building an adopted tab — now it's safe to tear it down
@@ -692,7 +788,19 @@ app.on('ready', () => {
 // pty exits, and during app quit the native addon tears down while the polling
 // interval is still firing. Kill every surviving pty BEFORE the native cleanup
 // runs, so no stray Napi call can abort the process.
-app.on('before-quit', () => {
+app.on('before-quit', (e) => {
+  // Ask before quitting if any window has a busy pane; on confirm, quit again
+  // and fall through to teardown. (Second pass: readyToQuit is set.)
+  if (!readyToQuit) {
+    const labels = allBusyLabels();
+    if (labels.length > 0) {
+      e.preventDefault();
+      confirmBusyClose(null, labels, 'Quit').then((ok) => {
+        if (ok) { readyToQuit = true; app.quit(); }
+      });
+      return;
+    }
+  }
   quitting = true;
   for (const [id, rec] of ptys) {
     try { rec.proc.kill(); } catch (e) { }

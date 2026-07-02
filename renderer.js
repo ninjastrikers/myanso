@@ -741,6 +741,21 @@ function paneWantsStd(pane) {
   return STD_MODE_NAMES.some((a) => fg.includes(a));
 }
 
+// Closing a pane/tab asks first when a non-shell program is still running in it
+// (e.g. Claude Code still loading). The busy check and the native dialog live in
+// main.js — it already tracks each pty's foreground process and can show an async
+// dialog without freezing the renderer's terminals. OS window-close and Cmd+Q are
+// guarded in main.js the same way. Here we just pass the pty ids being closed.
+function okToClosePtyIds(ptyIds) {
+  return ipcRenderer.invoke('confirm-close-ptys', { ptyIds });
+}
+async function requestClosePane(pane) {
+  if (pane && (await okToClosePtyIds([pane.ptyId]))) closePane(pane);
+}
+async function requestCloseTab(tab) {
+  if (tab && (await okToClosePtyIds(leavesOf(tab.root).map((p) => p.ptyId)))) closeTab(tab);
+}
+
 function updatePaneMarkWidth(pane) {
   if (!pane) return;
   const term = pane.term;
@@ -1569,7 +1584,7 @@ function renderTabBar() {
     close.addEventListener('mousedown', (e) => {
       e.stopPropagation();
       e.preventDefault();
-      closeTab(tab);
+      requestCloseTab(tab);
     });
     el.appendChild(close);
 
@@ -1706,7 +1721,7 @@ function showTabMenu(x, y, tab) {
   items.push({ sep: true });
   items.push({ render: () => buildTabColorRow(tab) });
   items.push({ sep: true });
-  items.push({ label: 'Close', icon: 'close', action: () => closeTab(tab) });
+  items.push({ label: 'Close', icon: 'close', action: () => requestCloseTab(tab) });
   if (tabs.length > 1) {
     items.push({ label: 'Close Other Tabs', icon: 'close-others', action: () => closeOtherTabs(tab) });
   }
@@ -1746,10 +1761,12 @@ function showTabMenu(x, y, tab) {
   menu.style.top = Math.max(4, py) + 'px';
 }
 
-function closeOtherTabs(keepTab) {
+async function closeOtherTabs(keepTab) {
   // Batch removal: dispose panes + DOM for all closing tabs, splice once, then
   // do a single selectTab + renderTabBar instead of O(n) rebuild cycles.
   const toClose = tabs.filter((t) => t !== keepTab);
+  const ptyIds = toClose.flatMap((t) => leavesOf(t.root).map((p) => p.ptyId));
+  if (!(await okToClosePtyIds(ptyIds))) return;
   for (const t of toClose) {
     leavesOf(t.root).forEach(disposePane);
     t.el.remove();
@@ -1816,7 +1833,7 @@ window.addEventListener('keydown', (e) => { if (e.key === 'Escape') hidePaneMenu
 
 ipcRenderer.on('new-tab', () => newTab());
 ipcRenderer.on('open-folder', (event, { path }) => newTab(path));
-ipcRenderer.on('close-pane', () => { if (activePane) closePane(activePane); });
+ipcRenderer.on('close-pane', () => { if (activePane) requestClosePane(activePane); });
 ipcRenderer.on('split-right', () => splitActive('row'));
 ipcRenderer.on('split-down', () => splitActive('col'));
 ipcRenderer.on('focus-prev', () => cyclePane(-1));
