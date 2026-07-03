@@ -78,7 +78,7 @@ app.whenReady().then(() => {
 // handler is registered up here, outside whenReady. A file resolves to its
 // parent directory.
 function resolveDropDir(p) {
-  try { if (!fs.statSync(p).isDirectory()) return path.dirname(p); } catch (_) {}
+  try { if (!fs.statSync(p).isDirectory()) return path.dirname(p); } catch (_) { }
   return p;
 }
 
@@ -98,7 +98,7 @@ function getDirFromArgv(argv, cwd) {
     const a = argv[i];
     if (!a || a.startsWith('-') || a === '.') continue;
     const full = path.resolve(cwd || process.cwd(), a);
-    try { fs.statSync(full); return resolveDropDir(full); } catch (_) {}
+    try { fs.statSync(full); return resolveDropDir(full); } catch (_) { }
   }
   return null;
 }
@@ -284,8 +284,7 @@ async function confirmBusyClose(win, labels, verb) {
     buttons: [verb, 'Cancel'],
     defaultId: 1,           // Cancel is the safe default (Enter cancels)
     cancelId: 1,
-    message: 'A process is still running.',
-    detail: `${names}\n\n${verb} anyway?`,
+    message: 'Do you want to close ?',
     noLink: true,
   };
   const { response } = (win && !win.isDestroyed())
@@ -476,7 +475,7 @@ function windowAtTabBar(point) {
     if (w.isDestroyed()) continue;
     const b = w.getContentBounds();
     if (point.x >= b.x && point.x <= b.x + b.width &&
-        point.y >= b.y && point.y <= b.y + CHROME_STRIP) {
+      point.y >= b.y && point.y <= b.y + CHROME_STRIP) {
       return w;
     }
   }
@@ -741,19 +740,19 @@ function buildMenu() {
   const isLinux = process.platform === 'linux';
   const editMenu = isLinux
     ? {
-        label: 'Edit',
-        submenu: [
-          { role: 'undo' },
-          { role: 'redo' },
-          { type: 'separator' },
-          { role: 'cut' },
-          { role: 'copy' },
-          { role: 'paste' },
-          { role: 'selectAll' },
-          { type: 'separator' },
-          settingsItem
-        ]
-      }
+      label: 'Edit',
+      submenu: [
+        { role: 'undo' },
+        { role: 'redo' },
+        { type: 'separator' },
+        { role: 'cut' },
+        { role: 'copy' },
+        { role: 'paste' },
+        { role: 'selectAll' },
+        { type: 'separator' },
+        settingsItem
+      ]
+    }
     : { role: 'editMenu' };
 
   const template = [
