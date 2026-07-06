@@ -1524,6 +1524,33 @@ function removeTabKeepPtys(tabId) {
   if (currentTab === tab) selectTab(tabs[Math.min(idx, tabs.length - 1)]);
 }
 
+// While dragging, if the cursor is over this window's tab bar, reorder `tabs`
+// live (iTerm-style) so the dragged tab slides to the slot under the cursor.
+// Cross-window moves are still handled by main on release; this only rearranges
+// within the current window.
+function reorderTabUnderCursor(tab, x, y) {
+  const bar = document.getElementById('tabbar');
+  const r = bar.getBoundingClientRect();
+  // Only reorder while the cursor is within the tab bar band.
+  if (y < r.top || y > r.bottom) return;
+  const from = tabs.indexOf(tab);
+  if (from === -1) return;
+  // Find the insertion index by comparing x against each tab button's midpoint.
+  let to = tabs.length - 1;
+  for (let i = 0; i < tabs.length; i++) {
+    const el = tabs[i].btnEl;
+    if (!el) continue;
+    const b = el.getBoundingClientRect();
+    if (x < b.left + b.width / 2) { to = i; break; }
+  }
+  if (to === from) return;
+  tabs.splice(from, 1);
+  // After removing `from`, indices past it shift left by one, so a rightward
+  // move must target `to - 1` to land in the intended slot.
+  tabs.splice(to > from ? to - 1 : to, 0, tab);
+  renderTabBar();
+}
+
 // Start a custom drag when a tab is pressed and the cursor moves past a small
 // threshold. Cross-window routing is decided by main (screen coordinates); here
 // we just announce the drag, follow the cursor with a ghost, and signal release.
@@ -1545,6 +1572,7 @@ function startTabDrag(tab, downEvent) {
     }
     ghost.style.left = e.clientX + 'px';
     ghost.style.top = e.clientY + 'px';
+    reorderTabUnderCursor(tab, e.clientX, e.clientY);
   };
   const onUp = () => {
     document.removeEventListener('mousemove', onMove);
