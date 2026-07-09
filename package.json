@@ -1,7 +1,7 @@
 {
   "name": "myanso",
   "productName": "Myanso",
-  "version": "0.3.9",
+  "version": "0.3.10",
   "description": "Myanso — a Myanmar-aware terminal.",
   "main": "main.js",
   "author": "saturngod",

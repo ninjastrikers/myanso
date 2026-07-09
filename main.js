@@ -147,6 +147,8 @@ app.on('open-file', (event, p) => {
 // window. Routing is therefore by BrowserWindow id, not a single global `win`.
 const ptys = new Map();          // ptyId -> { proc, ownerWinId }
 const ptyBuffers = new Map();    // ptyId -> string[] of output coalesced this tick
+let ptyFlushScheduled = false;   // at most one cross-pty flush per event-loop turn
+const SYNC_PREFIXES = ['\x1b[?2026', '\x1b[?202', '\x1b[?20', '\x1b[?2', '\x1b[?', '\x1b[', '\x1b'];
 let widCounter = 0;              // logical per-window id, only for unique pty-id prefixes
 const tabCounts = new Map();     // BrowserWindow.id -> tab count (drives "Go to Tab N")
 const pendingAdopt = new Map();  // BrowserWindow.id -> callback to run once its renderer is ready
@@ -162,6 +164,7 @@ function ownerWindow(id) {
 
 // Send all pty output buffered this tick as one IPC message per pty, then clear.
 function flushPtyBuffers() {
+  ptyFlushScheduled = false;
   for (const [id, chunks] of ptyBuffers) {
     ptyBuffers.delete(id);
     if (!chunks.length) continue;
@@ -331,16 +334,16 @@ function spawnPty(id, cols, rows, cwd, ownerWinId) {
     // `\e[?2026h/l` over to the next chunk before stripping.
     const rec = ptys.get(id);
     if (rec && rec.syncCarry) { data = rec.syncCarry + data; rec.syncCarry = ''; }
-    // Fast path: both regexes below can only match when `\e[?2` occurs in the
-    // chunk, so bulk output (cat, build logs) skips them on a cheap indexOf.
-    if (data.indexOf('\x1b[?2') !== -1) {
+    // A split may end as early as ESC or ESC[, so retain every proper prefix of
+    // the marker. Checking for ESC keeps ordinary bulk output on the fast path.
+    if (data.indexOf('\x1b') !== -1) {
       data = data.replace(/\x1b\[\?2026[hl]/g, '');
-      // Hold back a trailing fragment that could be the start of a 2026 sequence
-      // (at least `\e[?2`, so ordinary CSI/color codes aren't delayed a chunk).
-      const partial = data.match(/\x1b\[\?2(?:0(?:2(?:6)?)?)?$/);
+      // Hold back a trailing proper prefix of `\e[?2026h/l`; this handles every
+      // legal chunk split without delaying unrelated complete CSI sequences.
+      const partial = SYNC_PREFIXES.find((prefix) => data.endsWith(prefix));
       if (partial && rec) {
-        rec.syncCarry = data.slice(partial.index);
-        data = data.slice(0, partial.index);
+        rec.syncCarry = partial;
+        data = data.slice(0, -partial.length);
       }
     }
     // Batch pty output per main-process tick. Under heavy output (cat largefile,
@@ -348,10 +351,14 @@ function spawnPty(id, cols, rows, cwd, ownerWinId) {
     // per chunk is the real cost. Coalesce chunks that arrive in the same tick and
     // flush once on setImmediate — sub-ms latency, so interactive echo still feels
     // instant, but bulk output collapses into far fewer IPC round-trips.
+    if (!data) return; // a chunk containing only stripped mode markers
     let buf = ptyBuffers.get(id);
     if (!buf) {
       buf = [];
       ptyBuffers.set(id, buf);
+    }
+    if (!ptyFlushScheduled) {
+      ptyFlushScheduled = true;
       setImmediate(flushPtyBuffers);
     }
     buf.push(data);

@@ -686,9 +686,12 @@ function setupMarkWidth(term) {
   const provider = (version, isForced, forcedWidth) =>
     term.unicode.register({
       version,
-      wcwidth: (c) => (isForced(c) ? forcedWidth : base.wcwidth(c)),
-      charProperties: (c, preceding) =>
-        isForced(c) ? packMyanProps(forcedWidth, preceding) : base.charProperties(c, preceding),
+      // Almost all terminal text is outside the Myanmar block. Reject it before
+      // evaluating the detailed mark ranges, since these callbacks run per cell.
+      wcwidth: (c) => (c < 0x102b || c > 0x109d || !isForced(c))
+        ? base.wcwidth(c) : forcedWidth,
+      charProperties: (c, preceding) => (c < 0x102b || c > 0x109d || !isForced(c))
+        ? base.charProperties(c, preceding) : packMyanProps(forcedWidth, preceding),
     });
 
   provider('myan-shell', isMyanmarMark, 0);          // all marks 0, joined (zsh)
@@ -1466,21 +1469,35 @@ function closeTab(tab) {
 // the IPC boundary; the pty itself stays alive in main and is reattached in the
 // destination window.
 
-function serializeNode(node) {
+function serializeNode(node, includeScrollback) {
   if (node.leaf) {
     const p = node.pane;
-    return { leaf: true, pane: { ptyId: p.ptyId, cwd: p.cwd, title: p.title, scrollback: captureScrollback(p) } };
+    return {
+      leaf: true,
+      pane: {
+        ptyId: p.ptyId,
+        cwd: p.cwd,
+        title: p.title,
+        scrollback: includeScrollback ? captureScrollback(p) : ''
+      }
+    };
   }
-  return { leaf: false, dir: node.dir, ratio: node.ratio, a: serializeNode(node.a), b: serializeNode(node.b) };
+  return {
+    leaf: false,
+    dir: node.dir,
+    ratio: node.ratio,
+    a: serializeNode(node.a, includeScrollback),
+    b: serializeNode(node.b, includeScrollback)
+  };
 }
 
-function buildTabDescriptor(tab) {
+function buildTabDescriptor(tab, includeScrollback = true) {
   return {
     tabId: tab.id,
     title: tabDisplayName(tab),
     customTitle: tab.customTitle,
     color: tab.color,
-    tree: serializeNode(tab.root),
+    tree: serializeNode(tab.root, includeScrollback),
     ptyIds: leavesOf(tab.root).map((p) => p.ptyId)
   };
 }
@@ -1563,7 +1580,9 @@ function startTabDrag(tab, downEvent) {
     if (!active) {
       if (Math.abs(e.clientX - startX) + Math.abs(e.clientY - startY) < 6) return;
       active = true;
-      const descriptor = buildTabDescriptor(tab);
+      // The main process only needs identity and pty ids while tracking the
+      // drag. Avoid synchronously serializing scrollback until a real drop.
+      const descriptor = buildTabDescriptor(tab, false);
       ipcRenderer.send('tab-drag-start', { descriptor, ptyIds: descriptor.ptyIds });
       ghost = document.createElement('div');
       ghost.className = 'tab-drag-ghost';
