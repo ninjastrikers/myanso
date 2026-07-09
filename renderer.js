@@ -801,7 +801,7 @@ const panesByPtyId = new Map();   // ptyId -> pane
 // and scrollback hasn't replayed). Happens during cross-window tab transfer:
 // the pty is repointed to this window before adopt-tab builds the pane. Buffer
 // here, drain in mountPane (after scrollback) so nothing is dropped or
-// reordered. ptyId -> array of data chunks.
+// reordered. ptyId -> { chunks, bytes, flowPaused }.
 const pendingData = new Map();
 const tabs = [];                  // ordered list of open tabs
 let currentTab = null;
@@ -959,14 +959,21 @@ function writeToPane(pane, data) {
   try {
     pane.term.write(data, () => {
       pane._pending -= data.length;
-      if (pane._flowPaused && pane._pending < FLOW_LOW) {
-        pane._flowPaused = false;
-        ipcRenderer.send('pty-resume', { id: pane.ptyId });
-      }
+      maybeResumePane(pane);
     });
   } catch (e) {
     // Disposed mid-write (tab closed/moved). A paused pty is resumed by main
     // on hand-over (moveTabToWindow) or killed with the pane — never stuck.
+  }
+}
+
+function maybeResumePane(pane) {
+  // A transferred pane may register a whole pre-mount queue synchronously.
+  // Wait until every write is registered before an unusually eager write
+  // callback can resume the pty halfway through draining that queue.
+  if (pane._flowPaused && !pane._drainingPending && pane._pending < FLOW_LOW) {
+    pane._flowPaused = false;
+    ipcRenderer.send('pty-resume', { id: pane.ptyId });
   }
 }
 
@@ -988,16 +995,30 @@ function mountPane(pane) {
   const queued = pendingData.get(pane.ptyId);
   if (queued) {
     pendingData.delete(pane.ptyId);
-    for (const d of queued) writeToPane(pane, d);
+    // The pty may already have been paused while this tab was being rebuilt.
+    // Preserve that state until xterm has accepted the complete queue.
+    pane._flowPaused = queued.flowPaused;
+    pane._drainingPending = true;
+    for (const d of queued.chunks) writeToPane(pane, d);
+    pane._drainingPending = false;
+    maybeResumePane(pane);
   }
   setupMarkWidth(pane.term);
   updatePaneMarkWidth(pane);   // apply width for the app already running (if known)
   pane.term.textarea.addEventListener('focus', () => setActivePane(pane));
   // Refit (and tell the pty) whenever the host's box changes — covers window
   // resize, divider drags, and a tab becoming visible.
-  const ro = new ResizeObserver(() => fitPane(pane));
+  const ro = new ResizeObserver(() => scheduleFitPane(pane));
   ro.observe(pane.host);
   pane._ro = ro;
+}
+
+function scheduleFitPane(pane) {
+  if (pane._fitFrame) return;
+  pane._fitFrame = requestAnimationFrame(() => {
+    pane._fitFrame = null;
+    fitPane(pane);
+  });
 }
 
 function fitPane(pane) {
@@ -1036,6 +1057,7 @@ function fitPane(pane) {
 })();
 
 function disposePane(pane) {
+  if (pane._fitFrame) cancelAnimationFrame(pane._fitFrame);
   try { if (pane._ro) pane._ro.disconnect(); } catch (e) { }
   ipcRenderer.send('pty-kill', { id: pane.ptyId });
   panesByPtyId.delete(pane.ptyId);
@@ -1045,6 +1067,7 @@ function disposePane(pane) {
 // Like disposePane but leaves the pty ALIVE — used when a tab moves to another
 // window (the pty is reattached there). Tears down this window's view only.
 function releasePane(pane) {
+  if (pane._fitFrame) cancelAnimationFrame(pane._fitFrame);
   try { if (pane._ro) pane._ro.disconnect(); } catch (e) { }
   // Drop any data buffered for this pty — once released, nothing in this window
   // will ever mount it to drain the buffer (it lives on in the target window).
@@ -1056,9 +1079,9 @@ function releasePane(pane) {
 // Capture a pane's screen + scrollback as a string that can be written back into
 // a fresh terminal. SerializeAddon keeps colors/SGR; if it ever misbehaves with
 // this xterm build, fall back to plain text via the public buffer API.
-// Capped: this runs the moment a tab drag passes its 6px threshold (including
-// drags that end up cancelled), and serializing an unbounded scrollback makes
-// that first frame hitch. 2000 lines is plenty for a moved tab.
+// Capped: main asks for this only after it confirms a cross-window drop. Keeping
+// the transfer snapshot bounded prevents a split tab with deep history from
+// freezing the renderer while it is handed over. 2000 lines is ample context.
 const MOVE_SCROLLBACK_LINES = 2000;
 function captureScrollback(pane) {
   try {
@@ -1322,7 +1345,7 @@ function renderTab(tab) {
   // Now that the panes are attached, open any new terminals (correct glyph
   // measurement), then let flexbox settle and size each one.
   leaves.forEach(mountPane);
-  requestAnimationFrame(() => leaves.forEach(fitPane));
+  leaves.forEach(scheduleFitPane);
 }
 
 // `before` true puts the new pane ahead of the active one (Split Left / Split Up).
@@ -1438,9 +1461,9 @@ function selectTab(tab) {
   refreshTabTitle(tab); // update the window title bar for the shown tab
   // Re-focus the tab's last-active pane (or its first).
   const pane = panesByPtyId.get(tab.activePtyId) || leavesOf(tab.root)[0];
-  // Defer so the now-visible panes get measured before fitting/focusing.
+  // The now-visible panes need a frame to settle before fitting/focusing.
+  leavesOf(tab.root).forEach(scheduleFitPane);
   requestAnimationFrame(() => {
-    leavesOf(tab.root).forEach(fitPane);
     // Don't steal focus into the terminal if a rename editor just opened (e.g.
     // a double-click, whose mousedowns scheduled this rAF before the editor).
     if (pane && !activeTitleEdit) focusPane(pane);
@@ -1564,8 +1587,12 @@ function reorderTabUnderCursor(tab, x, y) {
   tabs.splice(from, 1);
   // After removing `from`, indices past it shift left by one, so a rightward
   // move must target `to - 1` to land in the intended slot.
-  tabs.splice(to > from ? to - 1 : to, 0, tab);
-  renderTabBar();
+  const destination = to > from ? to - 1 : to;
+  tabs.splice(destination, 0, tab);
+  // The tab buttons are stable while dragging, so move only this DOM node
+  // instead of rebuilding every tab and every event listener on each slot hop.
+  const next = tabs[destination + 1];
+  bar.insertBefore(tab.btnEl, next ? next.btnEl : null);
 }
 
 // Start a custom drag when a tab is pressed and the cursor moves past a small
@@ -1575,6 +1602,17 @@ function startTabDrag(tab, downEvent) {
   const startX = downEvent.clientX, startY = downEvent.clientY;
   let active = false;
   let ghost = null;
+  let reorderFrame = null;
+  let reorderPoint = null;
+
+  const scheduleReorder = (x, y) => {
+    reorderPoint = { x, y };
+    if (reorderFrame) return;
+    reorderFrame = requestAnimationFrame(() => {
+      reorderFrame = null;
+      if (reorderPoint) reorderTabUnderCursor(tab, reorderPoint.x, reorderPoint.y);
+    });
+  };
 
   const onMove = (e) => {
     if (!active) {
@@ -1591,17 +1629,18 @@ function startTabDrag(tab, downEvent) {
     }
     ghost.style.left = e.clientX + 'px';
     ghost.style.top = e.clientY + 'px';
-    reorderTabUnderCursor(tab, e.clientX, e.clientY);
+    scheduleReorder(e.clientX, e.clientY);
   };
   const onUp = () => {
     document.removeEventListener('mousemove', onMove);
     document.removeEventListener('mouseup', onUp);
+    if (reorderFrame) cancelAnimationFrame(reorderFrame);
     if (ghost) ghost.remove();
     if (active) {
-      // Re-serialize at drop time: output that arrived during the drag isn't in
-      // the drag-start descriptor, and would be missing from the moved tab.
-      const fresh = tabs.includes(tab) ? buildTabDescriptor(tab) : null;
-      ipcRenderer.send('tab-drag-end', fresh ? { descriptor: fresh } : undefined);
+      // Main first determines whether this is actually a cross-window move.
+      // That avoids synchronously serializing every pane's scrollback for a
+      // cancelled drag or an in-window reorder.
+      ipcRenderer.send('tab-drag-end');
     }
   };
   document.addEventListener('mousemove', onMove);
@@ -1668,8 +1707,19 @@ ipcRenderer.on('pty-data', (event, { id, data }) => {
     // Pane not built or not mounted yet (cross-window transfer in flight).
     // Buffer; mountPane drains it after scrollback replay.
     let q = pendingData.get(id);
-    if (!q) { q = []; pendingData.set(id, q); }
-    q.push(data);
+    if (!q) {
+      q = { chunks: [], bytes: 0, flowPaused: false };
+      pendingData.set(id, q);
+    }
+    q.chunks.push(data);
+    q.bytes += data.length;
+    // A tab transfer can briefly route data here before its pane exists. Apply
+    // the same bound as the normal xterm write queue so a noisy pty cannot grow
+    // an unbounded renderer-side array in that window.
+    if (!q.flowPaused && q.bytes > FLOW_HIGH) {
+      q.flowPaused = true;
+      ipcRenderer.send('pty-pause', { id });
+    }
   }
 });
 ipcRenderer.on('pty-exit', (event, { id }) => {
@@ -1684,6 +1734,14 @@ ipcRenderer.on('pty-process', (event, { id, name }) => {
 });
 
 ipcRenderer.on('adopt-tab', (event, { descriptor }) => adoptTab(descriptor));
+ipcRenderer.on('tab-drag-serialize', (event, { tabId }) => {
+  const tab = tabs.find((t) => t.id === tabId);
+  if (!tab) return;
+  ipcRenderer.send('tab-drag-serialized', {
+    tabId,
+    descriptor: buildTabDescriptor(tab)
+  });
+});
 ipcRenderer.on('remove-tab', (event, { tabId }) => removeTabKeepPtys(tabId));
 ipcRenderer.on('tab-drag-over', (event, { active }) => {
   document.getElementById('tabbar').classList.toggle('drop-target', active);
@@ -1905,7 +1963,7 @@ function applySettings(s) {
   document.body.style.background = t.background;
   applyUiVars(t);
   // Refit the visible tab to the new metrics.
-  if (currentTab) leavesOf(currentTab.root).forEach(fitPane);
+  if (currentTab) leavesOf(currentTab.root).forEach(scheduleFitPane);
 }
 
 // Push the theme's `ui` palette into CSS variables that the settings panel
@@ -2154,6 +2212,8 @@ const FIND_DECORATIONS = {
   activeMatchColorOverviewRuler: '#e0a000'
 };
 const findOpts = () => ({ caseSensitive: false, decorations: FIND_DECORATIONS });
+const FIND_INPUT_DEBOUNCE_MS = 90;
+let findInputTimer = null;
 
 const isFindOpen = () => findBar.classList.contains('open');
 
@@ -2173,8 +2233,26 @@ function runFind() {
   activePane.searchAddon.findNext(term, findOpts());
 }
 
-function findNext() { if (activePane && findInput.value) activePane.searchAddon.findNext(findInput.value, findOpts()); }
-function findPrev() { if (activePane && findInput.value) activePane.searchAddon.findPrevious(findInput.value, findOpts()); }
+function cancelScheduledFind() {
+  if (findInputTimer) { clearTimeout(findInputTimer); findInputTimer = null; }
+}
+
+function scheduleFind() {
+  cancelScheduledFind();
+  findInputTimer = setTimeout(() => {
+    findInputTimer = null;
+    runFind();
+  }, FIND_INPUT_DEBOUNCE_MS);
+}
+
+function findNext() {
+  cancelScheduledFind();
+  if (activePane && findInput.value) activePane.searchAddon.findNext(findInput.value, findOpts());
+}
+function findPrev() {
+  cancelScheduledFind();
+  if (activePane && findInput.value) activePane.searchAddon.findPrevious(findInput.value, findOpts());
+}
 
 function openFind() {
   findBar.classList.add('open');
@@ -2187,13 +2265,14 @@ function openFind() {
 }
 
 function closeFind() {
+  cancelScheduledFind();
   findBar.classList.remove('open');
   if (activePane) activePane.searchAddon.clearDecorations();
   findCount.textContent = '';
   if (activePane) activePane.term.focus();
 }
 
-findInput.addEventListener('input', () => runFind());
+findInput.addEventListener('input', scheduleFind);
 findInput.addEventListener('keydown', (e) => {
   if (e.key === 'Enter') { e.preventDefault(); e.shiftKey ? findPrev() : findNext(); }
   else if (e.key === 'Escape') { e.preventDefault(); closeFind(); }

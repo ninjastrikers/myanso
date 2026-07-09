@@ -69,8 +69,9 @@ if (process.platform === 'darwin') {
 app.whenReady().then(() => {
   if (process.platform === 'darwin' && app.dock) app.dock.setIcon(iconPath);
   // Watch each pty's foreground process so the renderer can switch Myanmar mark
-  // width per app (see pollPtyProcesses). 600ms is plenty for app switches.
-  setInterval(pollPtyProcesses, 600);
+  // width per app (see pollPtyProcesses). Poll often while a program is active,
+  // but back off at an idle shell to avoid native pty.process calls per pane.
+  schedulePtyProcessPoll(0);
 });
 
 // macOS: a folder (or file) dropped onto the dock icon, or `open` from Finder,
@@ -154,6 +155,12 @@ const tabCounts = new Map();     // BrowserWindow.id -> tab count (drives "Go to
 const pendingAdopt = new Map();  // BrowserWindow.id -> callback to run once its renderer is ready
 let quitting = false;            // set in before-quit to guard pollPtyProcesses
 let readyToQuit = false;         // set once the user confirms quitting a busy app
+let processPollTimer = null;
+let processPollDueAt = 0;
+let processPollFastUntil = 0;
+const PROCESS_POLL_ACTIVE_MS = 600;
+const PROCESS_POLL_IDLE_MS = 2000;
+const PROCESS_POLL_INPUT_GRACE_MS = 2000;
 
 function ownerWindow(id) {
   const rec = ptys.get(id);
@@ -201,11 +208,15 @@ function reportPtyProcess(id, rec, name) {
 }
 
 function pollPtyProcesses() {
-  if (quitting) return;
+  if (quitting) return false;
+  let hasActiveProcess = false;
   for (const [id, rec] of ptys) {
     let raw = '';
     let pid = 0;
     try { raw = (rec.proc.process || '').toString(); pid = rec.proc.pid; } catch (e) { /* dead pty */ }
+    // Keep polling a live program promptly; a settled shell can use the slower
+    // idle cadence. An empty name is treated as active until it resolves.
+    if (!SHELL_FG.test(raw)) hasActiveProcess = true;
     // Skip expensive resolution if the raw name hasn't changed.
     if (raw === rec.lastRaw) continue;
     rec.lastRaw = raw;
@@ -221,6 +232,29 @@ function pollPtyProcesses() {
     }
     reportPtyProcess(id, rec, raw);
   }
+  return hasActiveProcess;
+}
+
+function schedulePtyProcessPoll(delay) {
+  if (quitting) return;
+  const dueAt = Date.now() + delay;
+  // Keep an already-earlier poll. Input can preempt an idle-shell check, but
+  // rapid keystrokes do not continuously push that check farther away.
+  if (processPollTimer && processPollDueAt <= dueAt) return;
+  if (processPollTimer) clearTimeout(processPollTimer);
+  processPollDueAt = dueAt;
+  processPollTimer = setTimeout(() => {
+    processPollTimer = null;
+    processPollDueAt = 0;
+    const active = pollPtyProcesses();
+    const fast = active || Date.now() < processPollFastUntil;
+    schedulePtyProcessPoll(fast ? PROCESS_POLL_ACTIVE_MS : PROCESS_POLL_IDLE_MS);
+  }, delay);
+}
+
+function requestFastPtyProcessPoll() {
+  processPollFastUntil = Math.max(processPollFastUntil, Date.now() + PROCESS_POLL_INPUT_GRACE_MS);
+  schedulePtyProcessPoll(100);
 }
 
 // --- "A process is still running" confirm-before-close ----------------------
@@ -320,6 +354,7 @@ function spawnPty(id, cols, rows, cwd, ownerWinId) {
     }
   }
   ptys.set(id, { proc: p, ownerWinId, lastProcess: '', syncCarry: '' });
+  requestFastPtyProcessPoll();
   p.on('data', (data) => {
     // Strip synchronized-output markers (DEC mode 2026 set/reset). xterm.js 6 has
     // a bug: when a Myanmar combining mark joins an existing cell *inside* a 2026
@@ -502,6 +537,20 @@ function endDrag() {
   dragging = null;
 }
 
+// Scrollback serialization can be expensive for a split tab. Wait until main
+// has confirmed that the drag really leaves its source window, then ask the
+// source renderer for the fresh descriptor. In-window reorders and cancelled
+// drags avoid this work entirely.
+function requestTransferDescriptor(targetWin) {
+  if (!dragging || !targetWin || targetWin.isDestroyed()) { endDrag(); return; }
+  const { sourceWin, descriptor } = dragging;
+  if (!sourceWin || sourceWin.isDestroyed()) { endDrag(); return; }
+  if (dragTimer) { clearInterval(dragTimer); dragTimer = null; }
+  setDragTarget(null);
+  dragging.targetWin = targetWin;
+  sourceWin.webContents.send('tab-drag-serialize', { tabId: descriptor.tabId });
+}
+
 function moveTabToWindow(targetWin) {
   const { sourceWin, descriptor, ptyIds } = dragging;
   // Repoint each pty so its output now flows to the target window.
@@ -549,6 +598,7 @@ function setupIpc() {
   ipcMain.on('pty-input', (event, { id, data }) => {
     const rec = ptys.get(id);
     if (rec) { try { rec.proc.write(data); } catch (e) { } }
+    requestFastPtyProcessPoll();
   });
   ipcMain.on('pty-resize', (event, { id, cols, rows }) => {
     const rec = ptys.get(id);
@@ -626,12 +676,8 @@ function setupIpc() {
     }, 30);
   });
 
-  ipcMain.on('tab-drag-end', (event, payload) => {
+  ipcMain.on('tab-drag-end', (event) => {
     if (!dragging) return;
-    // The drag-start descriptor's scrollback is stale by drop time (output kept
-    // arriving during the drag); the source re-serializes on release and sends
-    // the fresh descriptor along.
-    if (payload && payload.descriptor) dragging.descriptor = payload.descriptor;
     const point = screen.getCursorScreenPoint();
     const target = windowAtTabBar(point);
     const sourceId = dragging.sourceWin && dragging.sourceWin.id;
@@ -641,19 +687,32 @@ function setupIpc() {
       return;
     }
     if (target) {
-      moveTabToWindow(target);
-      endDrag();
+      requestTransferDescriptor(target);
       return;
     }
     // Dropped outside every window → tear off into a new window near the cursor.
-    // Null `dragging` now so a second rapid tear-off doesn't share/overwrite this
-    // drag's state before the async createWindow callback restores it.
+    // Hold the drag state until the new renderer is ready, then ask the source
+    // for scrollback. This avoids serializing before we know a move is needed.
     const held = dragging;
-    dragging = null;
     const win = createWindow({ x: point.x - 40, y: point.y - 10 }, undefined, { noInitialTab: true });
-    onceReady(win, () => { dragging = held; moveTabToWindow(win); endDrag(); });
+    onceReady(win, () => {
+      if (dragging === held) requestTransferDescriptor(win);
+    });
     if (dragTimer) { clearInterval(dragTimer); dragTimer = null; }
     setDragTarget(null);
+  });
+
+  // The source has now serialized current scrollback, after main confirmed the
+  // target. Verify this is still the same drag before repointing its ptys.
+  ipcMain.on('tab-drag-serialized', (event, { tabId, descriptor }) => {
+    if (!dragging || !descriptor || dragging.descriptor.tabId !== tabId) return;
+    const sourceWin = BrowserWindow.fromWebContents(event.sender);
+    if (!sourceWin || !dragging.sourceWin || sourceWin.id !== dragging.sourceWin.id) return;
+    const target = dragging.targetWin;
+    if (!target || target.isDestroyed()) { endDrag(); return; }
+    dragging.descriptor = descriptor;
+    moveTabToWindow(target);
+    endDrag();
   });
 }
 
