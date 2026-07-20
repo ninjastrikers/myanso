@@ -150,6 +150,8 @@ const ptys = new Map();          // ptyId -> { proc, ownerWinId }
 const ptyBuffers = new Map();    // ptyId -> string[] of output coalesced this tick
 let ptyFlushScheduled = false;   // at most one cross-pty flush per event-loop turn
 const SYNC_PREFIXES = ['\x1b[?2026', '\x1b[?202', '\x1b[?20', '\x1b[?2', '\x1b[?', '\x1b[', '\x1b'];
+const SYNC_MARKER_NEEDLE = '?2026';
+const SYNC_PREFIX_MAX = SYNC_PREFIXES[0].length;
 let widCounter = 0;              // logical per-window id, only for unique pty-id prefixes
 const tabCounts = new Map();     // BrowserWindow.id -> tab count (drives "Go to Tab N")
 const pendingAdopt = new Map();  // BrowserWindow.id -> callback to run once its renderer is ready
@@ -215,8 +217,10 @@ function pollPtyProcesses() {
     let pid = 0;
     try { raw = (rec.proc.process || '').toString(); pid = rec.proc.pid; } catch (e) { /* dead pty */ }
     // Keep polling a live program promptly; a settled shell can use the slower
-    // idle cadence. An empty name is treated as active until it resolves.
-    if (!SHELL_FG.test(raw)) hasActiveProcess = true;
+    // idle cadence. ssh/mosh are opaque here: the local foreground stays the
+    // client for the whole remote session, so faster polling cannot reveal the
+    // program running remotely. An empty name stays active until it resolves.
+    if (!SHELL_FG.test(raw) && !REMOTE_SESSION_FG.test(raw)) hasActiveProcess = true;
     // Skip expensive resolution if the raw name hasn't changed.
     if (raw === rec.lastRaw) continue;
     rec.lastRaw = raw;
@@ -265,6 +269,7 @@ function requestFastPtyProcessPoll() {
 // close paths — per-pane, per-tab, OS window close, and Cmd+Q — go through it,
 // and the native dialog is async so it never freezes the renderer's terminals.
 const SHELL_FG = /^-?(zsh|bash|fish|dash|sh|ksh|tcsh|csh|pwsh|powershell)(\.exe)?$/;
+const REMOTE_SESSION_FG = /^-?(ssh|mosh|mosh-client)(\.exe)?$/i;
 function baseName(p) {
   const parts = String(p).split(/[\\/]/);
   return parts[parts.length - 1] || String(p);
@@ -370,12 +375,20 @@ function spawnPty(id, cols, rows, cwd, ownerWinId) {
     const rec = ptys.get(id);
     if (rec && rec.syncCarry) { data = rec.syncCarry + data; rec.syncCarry = ''; }
     // A split may end as early as ESC or ESC[, so retain every proper prefix of
-    // the marker. Checking for ESC keeps ordinary bulk output on the fast path.
+    // the marker. Most colored/TUI chunks contain ESC but not mode 2026: avoid
+    // running the full replacement regex unless its distinctive signature is
+    // present. Searching for the plain signature is faster on long colored runs;
+    // the exact regex below still decides what is actually removed.
     if (data.indexOf('\x1b') !== -1) {
-      data = data.replace(/\x1b\[\?2026[hl]/g, '');
+      if (data.indexOf(SYNC_MARKER_NEEDLE) !== -1) {
+        data = data.replace(/\x1b\[\?2026[hl]/g, '');
+      }
       // Hold back a trailing proper prefix of `\e[?2026h/l`; this handles every
       // legal chunk split without delaying unrelated complete CSI sequences.
-      const partial = SYNC_PREFIXES.find((prefix) => data.endsWith(prefix));
+      // Only the final seven characters can be such a prefix, so avoid making
+      // every candidate inspect the complete output chunk.
+      const tail = data.slice(-SYNC_PREFIX_MAX);
+      const partial = SYNC_PREFIXES.find((prefix) => tail.endsWith(prefix));
       if (partial && rec) {
         rec.syncCarry = partial;
         data = data.slice(0, -partial.length);
@@ -598,7 +611,11 @@ function setupIpc() {
   ipcMain.on('pty-input', (event, { id, data }) => {
     const rec = ptys.get(id);
     if (rec) { try { rec.proc.write(data); } catch (e) { } }
-    requestFastPtyProcessPoll();
+    // Input normally requests a prompt foreground-process check. Once the
+    // foreground is a remote client, however, local PTY inspection cannot see
+    // remote process changes, so repeated keystrokes should not keep polling it
+    // at the active cadence.
+    if (!rec || !REMOTE_SESSION_FG.test(rec.lastRaw || '')) requestFastPtyProcessPoll();
   });
   ipcMain.on('pty-resize', (event, { id, cols, rows }) => {
     const rec = ptys.get(id);

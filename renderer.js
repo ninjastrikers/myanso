@@ -947,7 +947,7 @@ function basename(p) {
 // drain and memory + input latency balloon. Count bytes in flight per pane and
 // ask main to pause the pty past the high mark; the write callbacks resume it
 // once drained below the low one. (Watermarks are UTF-16 units ≈ bytes.)
-const FLOW_HIGH = 1024 * 1024;  // pause above 1MB pending
+const FLOW_HIGH = 512 * 1024;   // pause above 512KB pending
 const FLOW_LOW = 128 * 1024;    // resume below 128KB
 
 function writeToPane(pane, data) {
