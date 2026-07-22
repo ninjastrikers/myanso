@@ -194,7 +194,11 @@
       min-height: 0;
       padding: 1px;
       box-sizing: border-box;
-      background: transparent;
+      /* Paint the gutter here so the terminal host itself can be inset.  The
+         fit addon measures the host's border box, but does not subtract
+         padding applied to that host; padding there can therefore create one
+         row/column too many and clip the last line after certain resizes. */
+      background: var(--term-bg, #15171e);
     }
 
     /* Dim inactive panes (overlay toward the theme bg) so the focused one
@@ -217,8 +221,10 @@
 
     .pane-term {
       position: absolute;
-      inset: 1px;
-      padding: 6px;
+      /* 1px pane edge + the 6px terminal gutter. Keeping the gutter outside
+         this measured box makes xterm's fitted grid match the visible area. */
+      inset: 7px;
+      padding: 0;
       box-sizing: border-box;
       background: var(--term-bg, #15171e);
     }
