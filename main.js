@@ -220,7 +220,7 @@ function pollPtyProcesses() {
     // idle cadence. ssh/mosh are opaque here: the local foreground stays the
     // client for the whole remote session, so faster polling cannot reveal the
     // program running remotely. An empty name stays active until it resolves.
-    if (!SHELL_FG.test(raw) && !REMOTE_SESSION_FG.test(raw)) hasActiveProcess = true;
+    if (!isShellForeground(raw) && !REMOTE_SESSION_FG.test(baseName(raw))) hasActiveProcess = true;
     // Skip expensive resolution if the raw name hasn't changed.
     if (raw === rec.lastRaw) continue;
     rec.lastRaw = raw;
@@ -274,11 +274,19 @@ function baseName(p) {
   const parts = String(p).split(/[\\/]/);
   return parts[parts.length - 1] || String(p);
 }
+// node-pty commonly reports a bare process name on macOS, but Linux builds may
+// return the full executable path. Also accept the user's configured shell even
+// when it is not one of the common names above (e.g. nushell or xonsh).
+function isShellForeground(name) {
+  const fg = baseName(String(name || '').trim()).toLowerCase();
+  const configured = baseName(shellPath).toLowerCase();
+  return SHELL_FG.test(fg) || fg.replace(/^-/, '') === configured.replace(/^-/, '');
+}
 // Returns a short program name to show the user, or null when the pty is idle
 // (a plain shell, or its foreground isn't known yet).
 function busyLabel(name) {
-  const fg = (name || '').toLowerCase();
-  if (fg === '' || SHELL_FG.test(fg)) return null;
+  const fg = String(name || '').trim();
+  if (fg === '' || isShellForeground(fg)) return null;
   let raw = String(name);
   if (raw.startsWith('node:')) {
     // 'node:<pid> <node-path> <script-path> <args…>' (from resolveNodeCmd).
@@ -291,11 +299,24 @@ function busyLabel(name) {
   }
   return baseName(raw) || 'a process';
 }
+// Read the foreground process again at close time instead of relying solely on
+// the poller's cache. This removes the short false-positive window after a
+// command exits and the prompt has already returned to the shell.
+function busyLabelForPty(rec) {
+  if (!rec) return null;
+  let current = '';
+  try { current = String(rec.proc.process || ''); } catch (_) { return null; }
+  if (!current || isShellForeground(current)) return null;
+  // Preserve a resolved node command when it still describes the current raw
+  // process; otherwise use the fresh value so stale cached apps cannot prompt.
+  const name = current === rec.lastRaw && rec.lastProcess ? rec.lastProcess : current;
+  return busyLabel(name);
+}
 function busyLabelsForPtyIds(ids) {
   const out = [];
   for (const id of ids || []) {
     const rec = ptys.get(id);
-    const label = rec && busyLabel(rec.lastProcess);
+    const label = busyLabelForPty(rec);
     if (label) out.push(label);
   }
   return out;
@@ -304,7 +325,7 @@ function busyLabelsForWindow(winId) {
   const out = [];
   for (const [, rec] of ptys) {
     if (rec.ownerWinId !== winId) continue;
-    const label = busyLabel(rec.lastProcess);
+    const label = busyLabelForPty(rec);
     if (label) out.push(label);
   }
   return out;
@@ -312,7 +333,7 @@ function busyLabelsForWindow(winId) {
 function allBusyLabels() {
   const out = [];
   for (const [, rec] of ptys) {
-    const label = busyLabel(rec.lastProcess);
+    const label = busyLabelForPty(rec);
     if (label) out.push(label);
   }
   return out;
@@ -320,13 +341,15 @@ function allBusyLabels() {
 // Shows the native "still running" prompt. Returns true if the user confirmed
 // the destructive action (the button named `verb`), false to cancel.
 async function confirmBusyClose(win, labels, verb) {
-  const names = [...new Set(labels)].join(', ');
+  const unique = [...new Set(labels)];
+  const names = unique.join(', ');
   const opts = {
     type: 'warning',
     buttons: [verb, 'Cancel'],
     defaultId: 1,           // Cancel is the safe default (Enter cancels)
     cancelId: 1,
-    message: 'Do you want to close ?',
+    message: verb === 'Quit' ? 'Quit Myanso?' : 'Close this terminal?',
+    detail: `${names} ${unique.length === 1 ? 'is' : 'are'} still running.`,
     noLink: true,
   };
   const { response } = (win && !win.isDestroyed())

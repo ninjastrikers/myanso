@@ -730,17 +730,22 @@ const ALL_ONE_TITLE = /claude/i;           // OSC terminal title → myan-allone
 const STD_MODE_NAMES = ['codex'];          // foreground process names → myan-std even on normal screen
 const SEMVER_FG = /^\d+\.\d+\.\d+/;        // Claude Code's process.title (version)
 const SHELL_FG = /^-?(zsh|bash|fish|dash|sh|ksh|tcsh|csh|pwsh|powershell)(\.exe)?$/;
+function isShellFg(name) {
+  const fg = String(name || '').split(/[\\/]/).pop().toLowerCase();
+  const configured = String(process.env.SHELL || '').split(/[\\/]/).pop().toLowerCase();
+  return SHELL_FG.test(fg) || (!!configured && fg.replace(/^-/, '') === configured.replace(/^-/, ''));
+}
 
 function paneWantsAllOne(pane) {
   const fg = (pane._fgProcess || '').toLowerCase();
-  if (fg === '' || SHELL_FG.test(fg)) return false;    // plain shell: no TUI running
+  if (fg === '' || isShellFg(fg)) return false;    // plain shell: no TUI running
   if (SEMVER_FG.test(fg) || ALL_ONE_NAMES.some((a) => fg.includes(a))) return true;
   return ALL_ONE_TITLE.test(pane.title || '');         // fall back to the app's title
 }
 
 function paneWantsStd(pane) {
   const fg = (pane._fgProcess || '').toLowerCase();
-  if (fg === '' || SHELL_FG.test(fg)) return false;
+  if (fg === '' || isShellFg(fg)) return false;
   return STD_MODE_NAMES.some((a) => fg.includes(a));
 }
 
