@@ -815,6 +815,9 @@ const nextId = (p) => p + '_' + WID + '_' + (++counter);
 function createPane(tabId, cwd, reattach) {
   const ptyId = reattach ? reattach.ptyId : nextId('pty');
   // Inherit the current pane's directory so new tabs/splits open where you are.
+  // Also send its pty id: Linux shells often omit OSC 7, so main resolves the
+  // authoritative cwd through /proc instead of trusting this cached value.
+  const inheritPtyId = cwd === undefined && activePane ? activePane.ptyId : undefined;
   if (cwd === undefined && activePane) cwd = activePane.cwd;
   const t = themeFor(settings);
 
@@ -922,7 +925,9 @@ function createPane(tabId, cwd, reattach) {
 
   // A reattached pane's pty is already running in main — don't spawn a new one.
   if (!reattach) {
-    ipcRenderer.send('pty-create', { id: ptyId, cols: 80, rows: 24, cwd: cwd || undefined });
+    ipcRenderer.send('pty-create', {
+      id: ptyId, cols: 80, rows: 24, cwd: cwd || undefined, inheritPtyId
+    });
   }
   return pane;
 }
@@ -1727,6 +1732,12 @@ ipcRenderer.on('pty-exit', (event, { id }) => {
   const pane = panesByPtyId.get(id);
   if (pane) closePane(pane);
 });
+// Main reports the directory actually used to launch the shell. This fills the
+// OSC 7 gap on Linux and keeps subsequent tab titles/inheritance up to date.
+ipcRenderer.on('pty-cwd', (event, { id, cwd }) => {
+  const pane = panesByPtyId.get(id);
+  if (pane && cwd) { pane.cwd = cwd; onPaneTitleChanged(pane); }
+});
 // Foreground app changed in this pty — pick the Myanmar mark width it expects.
 ipcRenderer.on('pty-process', (event, { id, name }) => {
   const pane = panesByPtyId.get(id);
@@ -1974,6 +1985,7 @@ function applyUiVars(t) {
   v.setProperty('--overlay-bg', ui.modalOverlay);
   v.setProperty('--panel-top', ui.panelTop);
   v.setProperty('--panel-bottom', ui.panelBottom);
+  v.setProperty('--panel-color-scheme', t.colorScheme);
   v.setProperty('--panel-fg', t.foreground);
   v.setProperty('--panel-border', ui.border);
   v.setProperty('--panel-muted', ui.muted);
@@ -1991,8 +2003,10 @@ function applyUiVars(t) {
   v.setProperty('--pane-dim', ui.paneDim);
 }
 
-// Tag the body so CSS can reserve space for the macOS traffic lights.
+// Tag the body for platform-only chrome. macOS keeps its native menu/titlebar;
+// Linux gets the browser-style in-app hamburger menu defined in index.html.
 if (process.platform === 'darwin') document.body.classList.add('mac');
+else if (process.platform === 'linux') document.body.classList.add('linux');
 
 // Fix platform-specific shortcut labels in the UI.
 const modKey = process.platform === 'darwin' ? 'Cmd' : 'Ctrl';
@@ -2290,6 +2304,92 @@ ipcRenderer.on('fullscreen', (event, on) => {
 
 // "+" in the tab bar opens a new tab.
 document.getElementById('tab-add').addEventListener('click', () => newTab());
+
+// Linux-only browser-style application menu. The native application menu stays
+// installed (and hidden) in main so Electron can continue registering its
+// accelerators; these buttons call the same underlying actions directly.
+const appMenuButton = document.getElementById('app-menu-button');
+const appMenu = document.getElementById('app-menu');
+const appMenuFontSize = document.getElementById('app-menu-font-size');
+const windowMinimize = document.getElementById('window-minimize');
+const windowMaximize = document.getElementById('window-maximize');
+const windowClose = document.getElementById('window-close');
+
+function setAppMenuOpen(open, refocus = false) {
+  appMenu.classList.toggle('open', open);
+  appMenuButton.setAttribute('aria-expanded', String(open));
+  if (open) {
+    appMenuFontSize.textContent = settings.fontSize + ' px';
+    const first = appMenu.querySelector('.app-menu-item');
+    if (first) first.focus();
+  } else if (refocus && activePane) {
+    activePane.term.focus();
+  }
+}
+
+function runAppMenuAction(action) {
+  // Font controls behave like Firefox's zoom controls and keep the menu open.
+  if (action === 'font-dec') changeFontSize(settings.fontSize - 1);
+  else if (action === 'font-inc') changeFontSize(settings.fontSize + 1);
+  else if (action === 'font-reset') changeFontSize(DEFAULTS.fontSize);
+  else {
+    setAppMenuOpen(false);
+    if (action === 'new-tab') newTab();
+    else if (action === 'new-window') ipcRenderer.send('open-window');
+    else if (action === 'close-pane' && activePane) requestClosePane(activePane);
+    else if (action === 'find') openFind();
+    else if (action === 'split-right') splitActive('row');
+    else if (action === 'split-down') splitActive('col');
+    else if (action === 'previous-pane') cyclePane(-1);
+    else if (action === 'next-pane') cyclePane(1);
+    else if (action === 'settings') openSettings();
+    else if (action === 'quit') ipcRenderer.send('quit-app');
+  }
+  appMenuFontSize.textContent = settings.fontSize + ' px';
+}
+
+appMenuButton.addEventListener('click', (e) => {
+  e.stopPropagation();
+  const opening = !appMenu.classList.contains('open');
+  setAppMenuOpen(opening, !opening);
+});
+
+appMenu.addEventListener('click', (e) => {
+  const target = e.target.closest('[data-action]');
+  if (target) runAppMenuAction(target.dataset.action);
+});
+
+window.addEventListener('mousedown', (e) => {
+  if (appMenu.classList.contains('open') &&
+      !appMenu.contains(e.target) && !appMenuButton.contains(e.target)) {
+    setAppMenuOpen(false);
+  }
+});
+window.addEventListener('blur', () => setAppMenuOpen(false));
+window.addEventListener('keydown', (e) => {
+  if (e.key === 'Escape' && appMenu.classList.contains('open')) {
+    e.preventDefault();
+    setAppMenuOpen(false, true);
+  }
+});
+
+// Linux's frameless BrowserWindow uses controls in the draggable tab strip.
+// Closing still goes through main's busy-process confirmation path.
+windowMinimize.addEventListener('click', () => ipcRenderer.send('window-minimize'));
+windowMaximize.addEventListener('click', () => ipcRenderer.send('window-toggle-maximize'));
+windowClose.addEventListener('click', () => ipcRenderer.send('close-window'));
+ipcRenderer.on('window-maximized', (event, maximized) => {
+  windowMaximize.classList.toggle('maximized', maximized);
+  windowMaximize.title = maximized ? 'Restore' : 'Maximize';
+  windowMaximize.setAttribute('aria-label', windowMaximize.title);
+});
+
+if (process.platform === 'linux') {
+  document.getElementById('chrome').addEventListener('dblclick', (e) => {
+    if (e.target.closest('#tabbar, .tab-add, #app-menu-button, #window-controls')) return;
+    ipcRenderer.send('window-toggle-maximize');
+  });
+}
 
 // Open the first tab. If launched by dropping a folder on the dock icon, main
 // passes it via --myanso-open= so the first tab starts there instead of $HOME.

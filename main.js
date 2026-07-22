@@ -341,6 +341,7 @@ function spawnPty(id, cols, rows, cwd, ownerWinId) {
   // user-supplied cwd is the problem, and if that still fails tell the renderer
   // via pty-exit instead of crashing.
   let p;
+  let launchedCwd = cwd || homeDir;
   const opts = { name: 'xterm-color', cols: cols || 80, rows: rows || 24, env: ptyEnv() };
   // Launch as a login shell so it sources the user's profile (.zprofile/.zshrc,
   // .bash_profile) — that's where Homebrew/nvm add node etc. to PATH. Without -l,
@@ -348,9 +349,10 @@ function spawnPty(id, cols, rows, cwd, ownerWinId) {
   // PowerShell: use -NoLogo to skip the banner (PS7 and 5.1 both support it).
   const shellArgs = os.platform() === 'win32' ? ['-NoLogo'] : ['-l'];
   try {
-    p = pty.spawn(shellPath, shellArgs, { ...opts, cwd: cwd || homeDir });
+    p = pty.spawn(shellPath, shellArgs, { ...opts, cwd: launchedCwd });
   } catch (e) {
     try {
+      launchedCwd = homeDir;
       p = pty.spawn(shellPath, shellArgs, { ...opts, cwd: homeDir });
     } catch (e2) {
       const w = BrowserWindow.fromId(ownerWinId);
@@ -358,7 +360,11 @@ function spawnPty(id, cols, rows, cwd, ownerWinId) {
       return;
     }
   }
-  ptys.set(id, { proc: p, ownerWinId, lastProcess: '', syncCarry: '' });
+  ptys.set(id, { proc: p, ownerWinId, cwd: launchedCwd, lastProcess: '', syncCarry: '' });
+  const owner = BrowserWindow.fromId(ownerWinId);
+  if (owner && !owner.isDestroyed()) {
+    owner.webContents.send('pty-cwd', { id, cwd: launchedCwd });
+  }
   requestFastPtyProcessPoll();
   p.on('data', (data) => {
     // Strip synchronized-output markers (DEC mode 2026 set/reset). xterm.js 6 has
@@ -422,6 +428,21 @@ function spawnPty(id, cols, rows, cwd, ownerWinId) {
   });
 }
 
+// Linux shells commonly do not emit OSC 7 directory updates. The shell process
+// itself still changes cwd after every successful `cd`, and procfs exposes that
+// directory without running an external command. Use it when a new pane asks to
+// inherit another pane's cwd. Other platforms keep using OSC 7 from renderer.
+function linuxPtyCwd(id) {
+  if (process.platform !== 'linux') return null;
+  const rec = ptys.get(id);
+  if (!rec) return null;
+  try {
+    const cwd = fs.readlinkSync(`/proc/${rec.proc.pid}/cwd`);
+    if (fs.statSync(cwd).isDirectory()) return cwd;
+  } catch (_) { }
+  return rec.cwd || null;
+}
+
 function createWindow(pos, initialDir, opts) {
   const wid = ++widCounter;
   // initialDir (optional): a folder dropped on the dock at cold start — the
@@ -438,7 +459,9 @@ function createWindow(pos, initialDir, opts) {
     y: pos && pos.y,
     backgroundColor: '#1e1e1e',
     icon: iconPath,
+    frame: process.platform !== 'linux',
     titleBarStyle: process.platform === 'darwin' ? 'hiddenInset' : 'default',
+    autoHideMenuBar: process.platform === 'linux',
     trafficLightPosition: { x: 12, y: 10 },
     webPreferences: {
       // Allow require() in the renderer so it can load node-pty/xterm directly.
@@ -460,11 +483,51 @@ function createWindow(pos, initialDir, opts) {
 
   win.loadFile('index.html');
 
+  // Some Linux desktop/menu integrations do not activate Electron's menu
+  // accelerators while xterm owns keyboard focus. Intercept the app shortcuts
+  // before Chromium hands them to xterm, otherwise the shell receives their
+  // Ctrl control characters. The hidden native menu remains the source of the
+  // visible shortcut definitions on macOS and Windows.
+  if (process.platform === 'linux') {
+    win.webContents.on('before-input-event', (event, input) => {
+      if (input.type !== 'keyDown' || input.isAutoRepeat ||
+          !input.control || input.alt || input.meta) return;
+      const key = String(input.key).toLowerCase();
+      const code = String(input.code);
+      const isKey = (name) => key === name.toLowerCase() || code === 'Key' + name.toUpperCase();
+      const send = (channel, ...args) => win.webContents.send(channel, ...args);
+      let handled = true;
+
+      if (isKey('t') && !input.shift) send('new-tab');
+      else if (isKey('n') && !input.shift) createWindow();
+      else if (isKey('w') && !input.shift) send('close-pane');
+      else if (isKey('f') && !input.shift) send('find');
+      else if (isKey('d')) send(input.shift ? 'split-down' : 'split-right');
+      else if ((key === '[' || code === 'BracketLeft') && !input.shift) send('focus-prev');
+      else if ((key === ']' || code === 'BracketRight') && !input.shift) send('focus-next');
+      else if ((key === ',' || code === 'Comma') && !input.shift) send('open-settings');
+      else if (key === '+' || key === '=' || code === 'Equal') send('font-inc');
+      else if ((key === '-' || code === 'Minus') && !input.shift) send('font-dec');
+      else if ((key === '0' || code === 'Digit0') && !input.shift) send('font-reset');
+      else if (isKey('q') && !input.shift) app.quit();
+      else {
+        const match = !input.shift && code.match(/^Digit([1-9])$/);
+        if (match) send('select-tab', Number(match[1]) - 1);
+        else handled = false;
+      }
+      if (!handled) return;
+      event.preventDefault();
+    });
+  }
+
   // Chromium persists per-window page zoom. A stray Cmd+- (old zoom binding)
   // could leave the UI zoomed with no way to reset it now that font shortcuts
   // replaced the zoom menu. Pin page zoom to 100% on every load.
   win.webContents.on('did-finish-load', () => {
     win.webContents.setZoomLevel(0);
+    if (process.platform === 'linux') {
+      win.webContents.send('window-maximized', win.isMaximized());
+    }
   });
 
   // In fullscreen the macOS traffic lights are hidden, so the tab bar can use
@@ -474,6 +537,14 @@ function createWindow(pos, initialDir, opts) {
   };
   win.on('enter-full-screen', () => sendFullscreen(true));
   win.on('leave-full-screen', () => sendFullscreen(false));
+  if (process.platform === 'linux') {
+    win.on('maximize', () => {
+      if (!win.isDestroyed()) win.webContents.send('window-maximized', true);
+    });
+    win.on('unmaximize', () => {
+      if (!win.isDestroyed()) win.webContents.send('window-maximized', false);
+    });
+  }
 
   // Keep "Go to Tab N" in sync with whichever window is focused.
   win.on('focus', () => buildMenu());
@@ -598,12 +669,12 @@ function moveTabToWindow(targetWin) {
 }
 
 function setupIpc() {
-  ipcMain.on('pty-create', (event, { id, cols, rows, cwd }) => {
+  ipcMain.on('pty-create', (event, { id, cols, rows, cwd, inheritPtyId }) => {
     // Can be null if the window was destroyed while the IPC was in flight —
     // a throw here would be an uncaught main-process exception.
     const w = BrowserWindow.fromWebContents(event.sender);
     if (!w) return;
-    spawnPty(id, cols, rows, cwd, w.id);
+    spawnPty(id, cols, rows, linuxPtyCwd(inheritPtyId) || cwd, w.id);
   });
   // node-pty's native write/resize/kill throw a Napi::Error if the pty already
   // exited (e.g. a stray resize during quit). Swallow it — an uncaught one
@@ -643,6 +714,16 @@ function setupIpc() {
     const w = BrowserWindow.fromWebContents(event.sender);
     if (w && !w.isDestroyed()) w.close();
   });
+  ipcMain.on('window-minimize', (event) => {
+    const w = BrowserWindow.fromWebContents(event.sender);
+    if (w && !w.isDestroyed()) w.minimize();
+  });
+  ipcMain.on('window-toggle-maximize', (event) => {
+    const w = BrowserWindow.fromWebContents(event.sender);
+    if (!w || w.isDestroyed()) return;
+    if (w.isMaximized()) w.unmaximize();
+    else w.maximize();
+  });
 
   // Renderer asks before closing a pane/tab: reply whether it's OK to proceed
   // (no busy pty, or the user confirmed the prompt).
@@ -662,6 +743,7 @@ function setupIpc() {
     }
   });
   ipcMain.on('open-window', () => createWindow());
+  ipcMain.on('quit-app', () => app.quit());
 
   // A renderer reports its tab count; refresh the menu if it is the focused one.
   // renderTabBar() sends this on every tab switch too, so skip the (relatively
@@ -854,6 +936,17 @@ function buildMenu() {
   ];
 
   Menu.setApplicationMenu(Menu.buildFromTemplate(template));
+
+  // Linux gets a browser-style hamburger menu in the renderer. Keep this
+  // application menu installed (its accelerators still work), but hide the
+  // native desktop menu bar in every window. macOS and Windows are untouched.
+  if (isLinux) {
+    for (const w of BrowserWindow.getAllWindows()) {
+      if (w.isDestroyed()) continue;
+      w.setAutoHideMenuBar(true);
+      w.setMenuBarVisibility(false);
+    }
+  }
 }
 
 app.on('ready', () => {

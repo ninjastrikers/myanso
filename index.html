@@ -174,6 +174,216 @@
       color: var(--panel-fg, #e4e4e4);
     }
 
+    /* Linux uses an in-app menu instead of Electron's desktop menu bar. Keep
+       the tabs compact like a browser, with the menu anchored at the far edge. */
+    body.linux #tabbar {
+      gap: 3px;
+      min-width: 0;
+    }
+
+    body.linux .tab {
+      height: 30px;
+      border-radius: 8px;
+    }
+
+    body.linux .tab.active {
+      box-shadow: 0 1px 3px rgba(0, 0, 0, 0.22);
+    }
+
+    body.linux .tab-add {
+      width: 28px;
+      height: 28px;
+    }
+
+    #app-menu-button {
+      display: none;
+      -webkit-app-region: no-drag;
+      flex: 0 0 auto;
+      align-items: center;
+      justify-content: center;
+      width: 30px;
+      height: 30px;
+      margin-left: auto;
+      padding: 0;
+      border: 0;
+      border-radius: 8px;
+      background: transparent;
+      color: var(--panel-fg, #e4e4e4);
+      font-size: 20px;
+      line-height: 1;
+      cursor: pointer;
+    }
+
+    body.linux #app-menu-button {
+      display: inline-flex;
+      order: -1;
+      margin-left: 0;
+      margin-right: 4px;
+    }
+
+    #app-menu-button:hover,
+    #app-menu-button[aria-expanded="true"] {
+      background: var(--control-hover, rgba(255, 255, 255, 0.08));
+    }
+
+    #app-menu-button svg {
+      width: 18px;
+      height: 18px;
+    }
+
+    /* Firefox-style Linux application menu. It is present but never displayed
+       on macOS or Windows, whose native application menus are unchanged. */
+    #app-menu {
+      display: none;
+      position: fixed;
+      top: 42px;
+      right: 8px;
+      z-index: 1001;
+      width: min(300px, calc(100vw - 16px));
+      max-height: calc(100vh - 50px);
+      overflow-y: auto;
+      box-sizing: border-box;
+      padding: 7px;
+      background: var(--panel-top, #1e2029);
+      color: var(--panel-fg, #e4e4e4);
+      border: 1px solid var(--panel-border, #2a2d38);
+      border-radius: 10px;
+      box-shadow: 0 10px 32px rgba(0, 0, 0, 0.42);
+      font: 14px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      user-select: none;
+    }
+
+    body.linux #app-menu.open {
+      display: block;
+      left: 8px;
+      right: auto;
+    }
+
+    #window-controls {
+      display: none;
+      -webkit-app-region: no-drag;
+      flex: 0 0 auto;
+      align-items: center;
+      gap: 8px;
+      margin-left: auto;
+    }
+
+    body.linux #window-controls {
+      display: flex;
+    }
+
+    .window-control {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      width: 30px;
+      height: 30px;
+      padding: 0;
+      border: 0;
+      border-radius: 50%;
+      background: var(--control-bg, rgba(255, 255, 255, 0.07));
+      color: var(--panel-fg, #e4e4e4);
+      cursor: pointer;
+    }
+
+    .window-control:hover {
+      background: var(--control-hover, rgba(255, 255, 255, 0.13));
+    }
+
+    .window-control.close:hover {
+      background: #c94f5d;
+      color: #fff;
+    }
+
+    .window-control svg {
+      width: 14px;
+      height: 14px;
+    }
+
+    #window-maximize .restore-icon,
+    #window-maximize.maximized .maximize-icon {
+      display: none;
+    }
+
+    #window-maximize.maximized .restore-icon {
+      display: block;
+    }
+
+    .app-menu-item {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 18px;
+      width: 100%;
+      min-height: 36px;
+      box-sizing: border-box;
+      padding: 7px 11px;
+      border: 0;
+      border-radius: 6px;
+      background: transparent;
+      color: inherit;
+      font: inherit;
+      text-align: left;
+      cursor: pointer;
+    }
+
+    .app-menu-item:hover,
+    .app-menu-item:focus-visible {
+      outline: none;
+      background: var(--control-hover, rgba(255, 255, 255, 0.08));
+    }
+
+    .app-menu-shortcut {
+      flex: 0 0 auto;
+      color: var(--panel-muted, #8b8f99);
+      font-size: 12px;
+    }
+
+    .app-menu-sep {
+      height: 1px;
+      margin: 6px 7px;
+      background: var(--panel-border, #2a2d38);
+    }
+
+    .app-menu-font-row {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      min-height: 38px;
+      padding: 4px 11px;
+    }
+
+    .app-menu-font-controls {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+    }
+
+    .app-menu-font-controls button {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      min-width: 28px;
+      height: 28px;
+      padding: 0 7px;
+      border: 0;
+      border-radius: 6px;
+      background: var(--control-bg, rgba(255, 255, 255, 0.04));
+      color: var(--panel-fg, #e4e4e4);
+      font: inherit;
+      cursor: pointer;
+    }
+
+    .app-menu-font-controls button:hover {
+      background: var(--control-hover, rgba(255, 255, 255, 0.08));
+    }
+
+    #app-menu-font-size {
+      min-width: 48px;
+      color: var(--panel-muted, #8b8f99);
+      font-size: 12px;
+    }
+
     /* --- Panes / splits --- */
     #panes {
       flex: 1 1 auto;
@@ -403,11 +613,20 @@
     .setting-row select {
       appearance: none;
       -webkit-appearance: none;
+      color-scheme: var(--panel-color-scheme, dark);
       background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 24 24' fill='none' stroke='%23999' stroke-width='2.5' stroke-linecap='round' stroke-linejoin='round'><polyline points='6 9 12 15 18 9'/></svg>");
       background-repeat: no-repeat;
       background-position: right 10px center;
       padding-right: 30px;
       cursor: pointer;
+    }
+
+    /* Chromium on Linux may use the native popup background while inheriting
+       the select's themed foreground. Give option rows an explicit matching
+       background so dark-theme text never lands on a white popup. */
+    .setting-row select option {
+      background-color: var(--panel-bottom, #1e1e1e);
+      color: var(--panel-fg, #d4d4d4);
     }
 
     .setting-row select:focus,
@@ -751,8 +970,76 @@
   <div id="chrome">
     <div id="tabbar"></div>
     <div class="tab-add" id="tab-add" title="New tab (Cmd+T)">+</div>
+    <button id="app-menu-button" type="button" title="Open menu" aria-label="Open menu"
+            aria-haspopup="menu" aria-controls="app-menu" aria-expanded="false">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.25"
+           stroke-linecap="round" aria-hidden="true">
+        <path d="M4 6h16M4 12h16M4 18h16"></path>
+      </svg>
+    </button>
+    <div id="window-controls" aria-label="Window controls">
+      <button class="window-control" id="window-minimize" type="button" title="Minimize" aria-label="Minimize">
+        <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.8"
+             stroke-linecap="round" aria-hidden="true"><path d="M3 8h10"></path></svg>
+      </button>
+      <button class="window-control" id="window-maximize" type="button" title="Maximize" aria-label="Maximize">
+        <svg class="maximize-icon" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.7"
+             aria-hidden="true"><rect x="3.5" y="3.5" width="9" height="9" rx="0.8"></rect></svg>
+        <svg class="restore-icon" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"
+             aria-hidden="true"><path d="M5.5 5.5V3.5h7v7h-2M3.5 5.5h7v7h-7z"></path></svg>
+      </button>
+      <button class="window-control close" id="window-close" type="button" title="Close" aria-label="Close">
+        <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.8"
+             stroke-linecap="round" aria-hidden="true"><path d="M3.5 3.5l9 9m0-9l-9 9"></path></svg>
+      </button>
+    </div>
   </div>
   <div id="panes"></div>
+
+  <div id="app-menu" role="menu" aria-label="Myanso menu">
+    <button class="app-menu-item" type="button" role="menuitem" data-action="new-tab">
+      <span>New tab</span><span class="app-menu-shortcut">Ctrl+T</span>
+    </button>
+    <button class="app-menu-item" type="button" role="menuitem" data-action="new-window">
+      <span>New window</span><span class="app-menu-shortcut">Ctrl+N</span>
+    </button>
+    <button class="app-menu-item" type="button" role="menuitem" data-action="close-pane">
+      <span>Close pane or tab</span><span class="app-menu-shortcut">Ctrl+W</span>
+    </button>
+    <div class="app-menu-sep" role="separator"></div>
+    <button class="app-menu-item" type="button" role="menuitem" data-action="find">
+      <span>Find</span><span class="app-menu-shortcut">Ctrl+F</span>
+    </button>
+    <button class="app-menu-item" type="button" role="menuitem" data-action="split-right">
+      <span>Split right</span><span class="app-menu-shortcut">Ctrl+D</span>
+    </button>
+    <button class="app-menu-item" type="button" role="menuitem" data-action="split-down">
+      <span>Split down</span><span class="app-menu-shortcut">Ctrl+Shift+D</span>
+    </button>
+    <button class="app-menu-item" type="button" role="menuitem" data-action="previous-pane">
+      <span>Previous pane</span><span class="app-menu-shortcut">Ctrl+[</span>
+    </button>
+    <button class="app-menu-item" type="button" role="menuitem" data-action="next-pane">
+      <span>Next pane</span><span class="app-menu-shortcut">Ctrl+]</span>
+    </button>
+    <div class="app-menu-sep" role="separator"></div>
+    <div class="app-menu-font-row">
+      <span>Font size</span>
+      <div class="app-menu-font-controls">
+        <button type="button" data-action="font-dec" aria-label="Decrease font size">−</button>
+        <button id="app-menu-font-size" type="button" data-action="font-reset" title="Reset font size">14 px</button>
+        <button type="button" data-action="font-inc" aria-label="Increase font size">+</button>
+      </div>
+    </div>
+    <div class="app-menu-sep" role="separator"></div>
+    <button class="app-menu-item" type="button" role="menuitem" data-action="settings">
+      <span>Settings</span><span class="app-menu-shortcut">Ctrl+,</span>
+    </button>
+    <div class="app-menu-sep" role="separator"></div>
+    <button class="app-menu-item" type="button" role="menuitem" data-action="quit">
+      <span>Quit Myanso</span><span class="app-menu-shortcut">Ctrl+Q</span>
+    </button>
+  </div>
 
   <div id="find-bar">
     <input id="find-input" type="text" placeholder="Find" spellcheck="false" />
