@@ -344,7 +344,12 @@ async function confirmBusyClose(win, labels, verb) {
   const unique = [...new Set(labels)];
   const names = unique.join(', ');
   const opts = {
-    type: 'warning',
+    // macOS otherwise substitutes its yellow warning triangle for warning/error
+    // message boxes. Use Myanso's app icon there, matching the branded quit
+    // prompt used by terminal apps such as iTerm2. Other platforms keep their
+    // native warning treatment.
+    type: process.platform === 'darwin' ? 'none' : 'warning',
+    ...(process.platform === 'darwin' ? { icon: iconPath } : {}),
     buttons: [verb, 'Cancel'],
     defaultId: 1,           // Cancel is the safe default (Enter cancels)
     cancelId: 1,
