@@ -2,7 +2,7 @@ const { app, BrowserWindow, ipcMain, Menu, screen, nativeImage, dialog } = requi
 const path = require('path');
 const fs = require('fs');
 const os = require('os');
-const { exec, execSync } = require('child_process');
+const { exec, execSync, execFileSync } = require('child_process');
 const pty = require('node-pty');
 
 // On Windows prefer PowerShell 7 (pwsh) if installed — it has better Unicode
@@ -456,17 +456,33 @@ function spawnPty(id, cols, rows, cwd, ownerWinId) {
   });
 }
 
-// Linux shells commonly do not emit OSC 7 directory updates. The shell process
-// itself still changes cwd after every successful `cd`, and procfs exposes that
-// directory without running an external command. Use it when a new pane asks to
-// inherit another pane's cwd. Other platforms keep using OSC 7 from renderer.
-function linuxPtyCwd(id) {
-  if (process.platform !== 'linux') return null;
+// Most shells do not emit OSC 7 directory updates: Linux distros rarely ship it,
+// and macOS only defines update_terminal_cwd for Apple Terminal (/etc/zshrc
+// sources /etc/zshrc_Apple_Terminal). So the renderer's cached pane.cwd is just
+// the directory the shell was LAUNCHED in and goes stale after the first `cd` —
+// a new tab would reopen $HOME. Ask the OS for the shell's real cwd instead.
+//   Linux : /proc/<pid>/cwd — a readlink, no external process.
+//   macOS : `lsof -a -p <pid> -d cwd -Fn` — no procfs equivalent exists. Only
+//           runs on new tab/split (never in the data path), and is capped by a
+//           timeout so a hung lsof can't stall the main process.
+// Windows has neither; it keeps using the renderer's value.
+function ptyCwd(id) {
   const rec = ptys.get(id);
   if (!rec) return null;
+  const pid = rec.proc && rec.proc.pid;
+  if (!pid) return rec.cwd || null;
   try {
-    const cwd = fs.readlinkSync(`/proc/${rec.proc.pid}/cwd`);
-    if (fs.statSync(cwd).isDirectory()) return cwd;
+    if (process.platform === 'linux') {
+      const cwd = fs.readlinkSync(`/proc/${pid}/cwd`);
+      if (fs.statSync(cwd).isDirectory()) return cwd;
+    } else if (process.platform === 'darwin') {
+      const out = execFileSync('/usr/sbin/lsof', ['-a', '-p', String(pid), '-d', 'cwd', '-Fn'],
+        { encoding: 'utf8', timeout: 1000, stdio: ['ignore', 'pipe', 'ignore'] });
+      // -Fn output is one field per line; the cwd path is the last 'n' line.
+      const line = out.split('\n').filter((l) => l.startsWith('n')).pop();
+      const cwd = line && line.slice(1);
+      if (cwd && fs.statSync(cwd).isDirectory()) return cwd;
+    }
   } catch (_) { }
   return rec.cwd || null;
 }
@@ -702,7 +718,7 @@ function setupIpc() {
     // a throw here would be an uncaught main-process exception.
     const w = BrowserWindow.fromWebContents(event.sender);
     if (!w) return;
-    spawnPty(id, cols, rows, linuxPtyCwd(inheritPtyId) || cwd, w.id);
+    spawnPty(id, cols, rows, ptyCwd(inheritPtyId) || cwd, w.id);
   });
   // node-pty's native write/resize/kill throw a Napi::Error if the pty already
   // exited (e.g. a stray resize during quit). Swallow it — an uncaught one
