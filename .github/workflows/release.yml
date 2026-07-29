@@ -6,7 +6,7 @@ on:
       - "v*"
 
 permissions:
-  contents: write
+  contents: read
 
 # Run JS actions (checkout, upload/download-artifact, etc.) on Node.js 24.
 # Node 20 action runtime is deprecated and removed from runners 2026-09-16.
@@ -45,7 +45,7 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@v5
         with:
-          node-version: 20
+          node-version: 24
           cache: npm
 
       - name: Setup Python (node-gyp)
@@ -70,6 +70,9 @@ jobs:
       - name: Patch xterm for Myanmar rendering
         run: node patches/patch-xterm-myanmar.js
 
+      - name: Run checks
+        run: npm run check
+
       - name: Package with electron-builder
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -77,6 +80,25 @@ jobs:
           LINUX_MAINTAINER: ${{ secrets.LINUX_MAINTAINER }}
         run: npx electron-builder ${{ matrix.platform.args }} -c.linux.maintainer="$LINUX_MAINTAINER" --publish never
         shell: bash
+
+      - name: Verify expected installers
+        shell: bash
+        run: |
+          require_ext() {
+            find dist -maxdepth 1 -type f -name "*.$1" -print -quit | grep -q . || {
+              echo "Missing required .$1 artifact" >&2
+              exit 1
+            }
+          }
+          case "${{ matrix.platform.name }}" in
+            "macOS (arm64)") require_ext dmg ;;
+            "Windows (NSIS)") require_ext exe ;;
+            "Linux "*)
+              require_ext AppImage
+              require_ext deb
+              require_ext rpm
+              ;;
+          esac
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v5
@@ -90,12 +112,14 @@ jobs:
             dist/*.exe
             dist/*.blockmap
             dist/latest*.yml
-          if-no-files-found: ignore
+          if-no-files-found: error
 
   release:
     name: Publish GitHub Release
     needs: build
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
       - name: Checkout
         uses: actions/checkout@v5

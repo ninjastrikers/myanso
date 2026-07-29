@@ -97,7 +97,7 @@ rAF-debounced renderer already batches frames, so there's no flicker cost.
 
 ## Architecture
 
-Four files, no build step:
+Core files, no JavaScript bundling step:
 
 ```
 keystroke → renderer.js (xterm onData) → IPC pty-input → main.js → node-pty
@@ -109,12 +109,16 @@ node-pty data → main.js (coalesce + strip 2026) → IPC pty-data → renderer.
   Handles multi-window, the app menu (accelerators work even while xterm holds
   focus), cross-window tab drag (by screen coordinates, since HTML5 DnD can't
   cross windows), the foreground-process poller, and the mode-2026 strip. Uses
-  `nodeIntegration` so the renderer can `require()` node-pty/xterm directly.
+  validated, window-owned IPC for every PTY operation.
+- **`preload.js`** — starts `renderer.js` in Electron's context-isolated preload
+  world; the page itself has no Node.js or Electron globals.
 - **`renderer.js`** — the entire UI: tab bar, split-pane tree, settings, find,
   links, and all xterm wiring, including the per-app Myanmar width logic
   (`setupMarkWidth`, `paneWantsAllOne`).
 - **`index.html`** — markup and styles.
 - **`patches/patch-xterm-myanmar.js`** — the shaping patch (see above).
+- **`lib/`** — tested stream, width-selection, terminal utility, and IPC
+  validation helpers shared by the main process and isolated renderer.
 
 For a deeper, code-level tour see [CLAUDE.md](CLAUDE.md).
 

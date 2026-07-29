@@ -2,8 +2,21 @@ const { app, BrowserWindow, ipcMain, Menu, screen, nativeImage, dialog } = requi
 const path = require('path');
 const fs = require('fs');
 const os = require('os');
+const { pathToFileURL } = require('url');
 const { exec, execSync, execFileSync } = require('child_process');
 const pty = require('node-pty');
+const { stripSynchronizedOutput } = require('./lib/sync-output');
+const {
+  validPtyId,
+  validTabId,
+  validPtyIds,
+  validPtyCreate,
+  validPtyInput,
+  validPtyResize,
+  validPtyReference,
+  validTabDescriptor,
+  validCloseRequest
+} = require('./lib/ipc-validation');
 
 // On Windows prefer PowerShell 7 (pwsh) if installed — it has better Unicode
 // handling, modern scripting, and cross-platform consistency. Falls back to the
@@ -49,6 +62,23 @@ function ptyEnv() {
 // In dev (`electron .`) the packaged icon isn't used, so set the dock icon
 // manually. Packaged builds get their icon from electron-builder.yml instead.
 const iconPath = path.join(__dirname, 'icon.png');
+const indexPath = path.join(__dirname, 'index.html');
+const indexUrl = pathToFileURL(indexPath).href;
+const permissionSessions = new WeakSet();
+
+function isTrustedWebContents(wc) {
+  if (!wc || wc.isDestroyed()) return false;
+  const win = BrowserWindow.fromWebContents(wc);
+  return !!win && !win.isDestroyed() && wc.getURL() === indexUrl;
+}
+
+function installPermissionPolicy(session) {
+  if (permissionSessions.has(session)) return;
+  permissionSessions.add(session);
+  const allowed = (wc, permission) => permission === 'local-fonts' && isTrustedWebContents(wc);
+  session.setPermissionRequestHandler((wc, permission, callback) => callback(allowed(wc, permission)));
+  session.setPermissionCheckHandler((wc, permission) => allowed(wc, permission));
+}
 
 // Gear icon for the Settings menu item. On macOS use the native SF Symbol
 // "gear" (Electron 42+ resolves SF Symbol names via createFromNamedImage),
@@ -149,9 +179,6 @@ app.on('open-file', (event, p) => {
 const ptys = new Map();          // ptyId -> { proc, ownerWinId }
 const ptyBuffers = new Map();    // ptyId -> string[] of output coalesced this tick
 let ptyFlushScheduled = false;   // at most one cross-pty flush per event-loop turn
-const SYNC_PREFIXES = ['\x1b[?2026', '\x1b[?202', '\x1b[?20', '\x1b[?2', '\x1b[?', '\x1b[', '\x1b'];
-const SYNC_MARKER_NEEDLE = '?2026';
-const SYNC_PREFIX_MAX = SYNC_PREFIXES[0].length;
 let widCounter = 0;              // logical per-window id, only for unique pty-id prefixes
 const tabCounts = new Map();     // BrowserWindow.id -> tab count (drives "Go to Tab N")
 const pendingAdopt = new Map();  // BrowserWindow.id -> callback to run once its renderer is ready
@@ -169,6 +196,18 @@ function ownerWindow(id) {
   if (!rec) return null;
   const w = BrowserWindow.fromId(rec.ownerWinId);
   return w && !w.isDestroyed() ? w : null;
+}
+
+function senderWindow(event) {
+  const win = event && BrowserWindow.fromWebContents(event.sender);
+  return win && !win.isDestroyed() ? win : null;
+}
+
+function ownedPty(event, id) {
+  if (!validPtyId(id)) return null;
+  const win = senderWindow(event);
+  const rec = ptys.get(id);
+  return win && rec && rec.ownerWinId === win.id ? rec : null;
 }
 
 // Send all pty output buffered this tick as one IPC message per pty, then clear.
@@ -407,27 +446,9 @@ function spawnPty(id, cols, rows, cwd, ownerWinId) {
     // later render is buffered, never drawn). So carry a trailing partial of
     // `\e[?2026h/l` over to the next chunk before stripping.
     const rec = ptys.get(id);
-    if (rec && rec.syncCarry) { data = rec.syncCarry + data; rec.syncCarry = ''; }
-    // A split may end as early as ESC or ESC[, so retain every proper prefix of
-    // the marker. Most colored/TUI chunks contain ESC but not mode 2026: avoid
-    // running the full replacement regex unless its distinctive signature is
-    // present. Searching for the plain signature is faster on long colored runs;
-    // the exact regex below still decides what is actually removed.
-    if (data.indexOf('\x1b') !== -1) {
-      if (data.indexOf(SYNC_MARKER_NEEDLE) !== -1) {
-        data = data.replace(/\x1b\[\?2026[hl]/g, '');
-      }
-      // Hold back a trailing proper prefix of `\e[?2026h/l`; this handles every
-      // legal chunk split without delaying unrelated complete CSI sequences.
-      // Only the final seven characters can be such a prefix, so avoid making
-      // every candidate inspect the complete output chunk.
-      const tail = data.slice(-SYNC_PREFIX_MAX);
-      const partial = SYNC_PREFIXES.find((prefix) => tail.endsWith(prefix));
-      if (partial && rec) {
-        rec.syncCarry = partial;
-        data = data.slice(0, -partial.length);
-      }
-    }
+    const stripped = stripSynchronizedOutput(data, rec && rec.syncCarry);
+    data = stripped.data;
+    if (rec) rec.syncCarry = stripped.carry;
     // Batch pty output per main-process tick. Under heavy output (cat largefile,
     // build logs) a pty emits many small chunks; one IPC message + one term.write
     // per chunk is the real cost. Coalesce chunks that arrive in the same tick and
@@ -508,24 +529,31 @@ function createWindow(pos, initialDir, opts) {
     autoHideMenuBar: process.platform === 'linux',
     trafficLightPosition: { x: 12, y: 10 },
     webPreferences: {
-      // Allow require() in the renderer so it can load node-pty/xterm directly.
-      nodeIntegration: true,
-      contextIsolation: false,
+      // renderer.js is loaded by preload.js in an isolated world. The page's
+      // main world has no Node/Electron access; preload keeps local package
+      // access without adding a bundler or changing xterm's DOM execution.
+      preload: path.join(__dirname, 'preload.js'),
+      nodeIntegration: false,
+      contextIsolation: true,
+      sandbox: false,
       // The renderer reads this to prefix its pty/tab ids so two windows never
       // generate the same id (e.g. pty_1).
       additionalArguments: extraArgs
     }
   });
 
-  // The settings panel lists the system's installed monospaced fonts via the
-  // Local Font Access API (window.queryLocalFonts), which needs the
-  // 'local-fonts' permission. Grant it for our own renderer.
-  win.webContents.session.setPermissionRequestHandler((wc, perm, cb) => {
-    cb(perm === 'local-fonts');
-  });
-  win.webContents.session.setPermissionCheckHandler((wc, perm) => perm === 'local-fonts');
+  // Only the local application document may request local-font enumeration.
+  // The handler is session-wide, so install the strict policy once.
+  installPermissionPolicy(win.webContents.session);
 
-  win.loadFile('index.html');
+  // Terminal output and local packages must never navigate the privileged app
+  // document or create another renderer. OSC 8 links use shell.openExternal.
+  win.webContents.on('will-navigate', (event, url) => {
+    if (url !== indexUrl) event.preventDefault();
+  });
+  win.webContents.setWindowOpenHandler(() => ({ action: 'deny' }));
+
+  win.loadFile(indexPath);
 
   // Some Linux desktop/menu integrations do not activate Electron's menu
   // accelerators while xterm owns keyboard focus. Intercept the app shortcuts
@@ -634,8 +662,8 @@ function onceReady(win, cb) {
 // dropped onto.
 const CHROME_STRIP = 38; // tab-bar height (see #chrome in index.html)
 let dragging = null;     // { sourceWin, descriptor, ptyIds }
-// Tabs awaiting the target's adopt ack before the source removes them.
-// source tabId (globally unique, WID-prefixed) -> source BrowserWindow.
+// Tabs awaiting the expected target's adopt ack before the source removes them.
+// source tabId -> { sourceWin, targetWin, ptyIds }.
 const pendingRemoval = new Map();
 let dragTimer = null;
 let dragTarget = null;   // window currently highlighted as a drop target
@@ -681,6 +709,11 @@ function requestTransferDescriptor(targetWin) {
 
 function moveTabToWindow(targetWin) {
   const { sourceWin, descriptor, ptyIds } = dragging;
+  if (!sourceWin || sourceWin.isDestroyed() || !targetWin || targetWin.isDestroyed() ||
+      !ptyIds.every((id) => {
+        const rec = ptys.get(id);
+        return rec && rec.ownerWinId === sourceWin.id;
+      })) return false;
   // Repoint each pty so its output now flows to the target window.
   for (const id of ptyIds) {
     const rec = ptys.get(id);
@@ -696,9 +729,7 @@ function moveTabToWindow(targetWin) {
   // actually built the tab risked losing it on a timing hiccup. Instead wait for
   // the target's 'tab-adopted' ack (below), then send remove-tab. ptyIds are
   // already repointed, so output in the gap is buffered by the target renderer.
-  if (sourceWin && !sourceWin.isDestroyed()) {
-    pendingRemoval.set(descriptor.tabId, sourceWin);
-  }
+  pendingRemoval.set(descriptor.tabId, { sourceWin, targetWin, ptyIds: [...ptyIds] });
   targetWin.webContents.send('adopt-tab', { descriptor });
   // The descriptor doesn't carry each pane's foreground process, and the poller
   // won't re-send it (the raw name hasn't changed) — so a moved tab running e.g.
@@ -710,47 +741,58 @@ function moveTabToWindow(targetWin) {
       targetWin.webContents.send('pty-process', { id, name: rec.lastProcess });
     }
   }
+  return true;
 }
 
 function setupIpc() {
-  ipcMain.on('pty-create', (event, { id, cols, rows, cwd, inheritPtyId }) => {
+  ipcMain.on('pty-create', (event, payload) => {
+    if (!validPtyCreate(payload) || ptys.has(payload.id)) return;
+    const { id, cols, rows, cwd, inheritPtyId } = payload;
     // Can be null if the window was destroyed while the IPC was in flight —
     // a throw here would be an uncaught main-process exception.
-    const w = BrowserWindow.fromWebContents(event.sender);
+    const w = senderWindow(event);
     if (!w) return;
-    spawnPty(id, cols, rows, ptyCwd(inheritPtyId) || cwd, w.id);
+    if (inheritPtyId && !ownedPty(event, inheritPtyId)) return;
+    spawnPty(id, cols, rows, inheritPtyId ? ptyCwd(inheritPtyId) : cwd, w.id);
   });
   // node-pty's native write/resize/kill throw a Napi::Error if the pty already
   // exited (e.g. a stray resize during quit). Swallow it — an uncaught one
   // aborts the whole process.
-  ipcMain.on('pty-input', (event, { id, data }) => {
-    const rec = ptys.get(id);
-    if (rec) { try { rec.proc.write(data); } catch (e) { } }
+  ipcMain.on('pty-input', (event, payload) => {
+    if (!validPtyInput(payload)) return;
+    const { id, data } = payload;
+    const rec = ownedPty(event, id);
+    if (!rec) return;
+    try { rec.proc.write(data); } catch (e) { }
     // Input normally requests a prompt foreground-process check. Once the
     // foreground is a remote client, however, local PTY inspection cannot see
     // remote process changes, so repeated keystrokes should not keep polling it
     // at the active cadence.
-    if (!rec || !REMOTE_SESSION_FG.test(rec.lastRaw || '')) requestFastPtyProcessPoll();
+    if (!REMOTE_SESSION_FG.test(rec.lastRaw || '')) requestFastPtyProcessPoll();
   });
-  ipcMain.on('pty-resize', (event, { id, cols, rows }) => {
-    const rec = ptys.get(id);
-    if (rec && cols > 0 && rows > 0) { try { rec.proc.resize(cols, rows); } catch (e) { } }
+  ipcMain.on('pty-resize', (event, payload) => {
+    if (!validPtyResize(payload)) return;
+    const rec = ownedPty(event, payload.id);
+    if (rec) { try { rec.proc.resize(payload.cols, payload.rows); } catch (e) { } }
   });
-  ipcMain.on('pty-kill', (event, { id }) => {
-    const rec = ptys.get(id);
-    if (rec) { try { rec.proc.kill(); } catch (e) { } ptys.delete(id); }
+  ipcMain.on('pty-kill', (event, payload) => {
+    if (!validPtyReference(payload)) return;
+    const rec = ownedPty(event, payload.id);
+    if (rec) { try { rec.proc.kill(); } catch (e) { } ptys.delete(payload.id); }
   });
 
   // Renderer-driven flow control: when xterm's write queue backs up (a huge
   // `cat`, fast build logs), the renderer asks main to stop reading the pty
   // until it catches up — otherwise the queue grows without bound and the UI
   // stalls. See writeToPane() in renderer.js for the watermarks.
-  ipcMain.on('pty-pause', (event, { id }) => {
-    const rec = ptys.get(id);
+  ipcMain.on('pty-pause', (event, payload) => {
+    if (!validPtyReference(payload)) return;
+    const rec = ownedPty(event, payload.id);
     if (rec && !rec.paused) { rec.paused = true; try { rec.proc.pause(); } catch (e) { } }
   });
-  ipcMain.on('pty-resume', (event, { id }) => {
-    const rec = ptys.get(id);
+  ipcMain.on('pty-resume', (event, payload) => {
+    if (!validPtyReference(payload)) return;
+    const rec = ownedPty(event, payload.id);
     if (rec && rec.paused) { rec.paused = false; try { rec.proc.resume(); } catch (e) { } }
   });
 
@@ -771,7 +813,9 @@ function setupIpc() {
 
   // Renderer asks before closing a pane/tab: reply whether it's OK to proceed
   // (no busy pty, or the user confirmed the prompt).
-  ipcMain.handle('confirm-close-ptys', async (event, { ptyIds }) => {
+  ipcMain.handle('confirm-close-ptys', async (event, payload) => {
+    if (!validCloseRequest(payload) || !payload.ptyIds.every((id) => ownedPty(event, id))) return false;
+    const { ptyIds } = payload;
     const labels = busyLabelsForPtyIds(ptyIds);
     if (labels.length === 0) return true;
     return confirmBusyClose(BrowserWindow.fromWebContents(event.sender), labels, 'Close');
@@ -779,22 +823,27 @@ function setupIpc() {
 
   // The target finished building an adopted tab — now it's safe to tear it down
   // in the source (which may then close the source window). See moveTabToWindow.
-  ipcMain.on('tab-adopted', (event, { tabId }) => {
-    const sourceWin = pendingRemoval.get(tabId);
+  ipcMain.on('tab-adopted', (event, payload) => {
+    if (!payload || !validTabId(payload.tabId)) return;
+    const { tabId } = payload;
+    const pending = pendingRemoval.get(tabId);
+    const targetWin = senderWindow(event);
+    if (!pending || !targetWin || pending.targetWin.id !== targetWin.id) return;
     pendingRemoval.delete(tabId);
-    if (sourceWin && !sourceWin.isDestroyed()) {
-      sourceWin.webContents.send('remove-tab', { tabId });
+    if (!pending.sourceWin.isDestroyed()) {
+      pending.sourceWin.webContents.send('remove-tab', { tabId });
     }
   });
-  ipcMain.on('open-window', () => createWindow());
-  ipcMain.on('quit-app', () => app.quit());
+  ipcMain.on('open-window', (event) => { if (senderWindow(event)) createWindow(); });
+  ipcMain.on('quit-app', (event) => { if (senderWindow(event)) app.quit(); });
 
   // A renderer reports its tab count; refresh the menu if it is the focused one.
   // renderTabBar() sends this on every tab switch too, so skip the (relatively
   // expensive) menu rebuild when the count didn't change; an unfocused window's
   // change is picked up by the rebuild its 'focus' event triggers.
   ipcMain.on('tab-count', (event, n) => {
-    const w = BrowserWindow.fromWebContents(event.sender);
+    if (!Number.isInteger(n) || n < 0 || n > 1000) return;
+    const w = senderWindow(event);
     if (!w || tabCounts.get(w.id) === n) return;
     tabCounts.set(w.id, n);
     if (w.isFocused()) buildMenu();
@@ -802,17 +851,21 @@ function setupIpc() {
 
   // A (possibly freshly created) window is ready to receive an adopted tab.
   ipcMain.on('renderer-ready', (event) => {
-    const w = BrowserWindow.fromWebContents(event.sender);
+    const w = senderWindow(event);
     if (!w) return;
     const cb = pendingAdopt.get(w.id);
     if (cb) { pendingAdopt.delete(w.id); cb(); }
   });
 
   // Tab drag: source window announces the drag; main polls the cursor.
-  ipcMain.on('tab-drag-start', (event, { descriptor, ptyIds }) => {
+  ipcMain.on('tab-drag-start', (event, payload) => {
+    if (!payload || !validTabDescriptor(payload.descriptor) || !validPtyIds(payload.ptyIds) ||
+        payload.ptyIds.length !== payload.descriptor.ptyIds.length ||
+        !payload.ptyIds.every((id) => payload.descriptor.ptyIds.includes(id) && ownedPty(event, id))) return;
     endDrag();
-    const sourceWin = BrowserWindow.fromWebContents(event.sender);
-    dragging = { sourceWin, descriptor, ptyIds };
+    const sourceWin = senderWindow(event);
+    if (!sourceWin) return;
+    dragging = { sourceWin, descriptor: payload.descriptor, ptyIds: [...payload.ptyIds] };
     dragTimer = setInterval(() => {
       if (!dragging) return;
       setDragTarget(windowAtTabBar(screen.getCursorScreenPoint()));
@@ -820,7 +873,8 @@ function setupIpc() {
   });
 
   ipcMain.on('tab-drag-end', (event) => {
-    if (!dragging) return;
+    const sourceWin = senderWindow(event);
+    if (!dragging || !sourceWin || !dragging.sourceWin || sourceWin.id !== dragging.sourceWin.id) return;
     const point = screen.getCursorScreenPoint();
     const target = windowAtTabBar(point);
     const sourceId = dragging.sourceWin && dragging.sourceWin.id;
@@ -847,9 +901,13 @@ function setupIpc() {
 
   // The source has now serialized current scrollback, after main confirmed the
   // target. Verify this is still the same drag before repointing its ptys.
-  ipcMain.on('tab-drag-serialized', (event, { tabId, descriptor }) => {
-    if (!dragging || !descriptor || dragging.descriptor.tabId !== tabId) return;
-    const sourceWin = BrowserWindow.fromWebContents(event.sender);
+  ipcMain.on('tab-drag-serialized', (event, payload) => {
+    if (!payload || !validTabId(payload.tabId) || !validTabDescriptor(payload.descriptor)) return;
+    const { tabId, descriptor } = payload;
+    if (!dragging || dragging.descriptor.tabId !== tabId || descriptor.tabId !== tabId ||
+        descriptor.ptyIds.length !== dragging.ptyIds.length ||
+        !descriptor.ptyIds.every((id) => dragging.ptyIds.includes(id))) return;
+    const sourceWin = senderWindow(event);
     if (!sourceWin || !dragging.sourceWin || sourceWin.id !== dragging.sourceWin.id) return;
     const target = dragging.targetWin;
     if (!target || target.isDestroyed()) { endDrag(); return; }

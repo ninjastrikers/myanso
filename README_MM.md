@@ -59,17 +59,19 @@ Main process သည် PTY တစ်ခုချင်းစီ၏ foreground pr
 
 ## တည်ဆောက်ပုံစနစ် (Architecture)
 
-ဖိုင်လေးဖိုင်သာ ပါဝင်ပြီး build step မလိုပါ -
+အဓိကဖိုင်များကို JavaScript bundling build step မလိုဘဲ အသုံးပြုထားသည် -
 
 ```
 နှိပ်လိုက်သော ခလုတ် (keystroke) → renderer.js (xterm onData) → IPC pty-input → main.js → node-pty
 node-pty အချက်အလက် → main.js (စုစည်းခြင်း + strip 2026) → IPC pty-data → renderer.js → xterm
 ```
 
-- **`main.js`** — Electron main process ဖြစ်သည်။ module-level `ptys` map ထဲတွင် pane တစ်ခုစီအတွက် `node-pty` တစ်ခုစီ ရှိသည်။ tab များကို window များအကြား ရွှေ့ပြောင်းနိုင်ရန်အတွက် PTY process များသည် window များထက် ပိုမိုကြာရှည်စွာ တည်ရှိနေမည် (outlive) ဖြစ်သည်။ multi-window လုပ်ဆောင်ချက်များ၊ app menu (xterm focus ရှိနေစဉ်တွင်လည်း keyboard shortcuts များ အလုပ်လုပ်စေရန်)၊ window များအကြား tab ဆွဲရွှေ့ခြင်း (HTML5 DnD သည် window များကို မကျော်ဖြတ်နိုင်သောကြောင့် screen coordinates များကို သုံးထားသည်)၊ foreground-process poller နှင့် mode-2026 ကို ဖယ်ထုတ်ခြင်း (strip) တို့ကို ကိုင်တွယ်ဆောင်ရွက်ပေးသည်။ renderer မှ node-pty/xterm တို့ကို တိုက်ရိုက် `require()` လုပ်နိုင်ရန် `nodeIntegration` ကို အသုံးပြုထားသည်။
+- **`main.js`** — Electron main process ဖြစ်သည်။ module-level `ptys` map ထဲတွင် pane တစ်ခုစီအတွက် `node-pty` တစ်ခုစီ ရှိသည်။ tab များကို window များအကြား ရွှေ့ပြောင်းနိုင်ရန်အတွက် PTY process များသည် window များထက် ပိုမိုကြာရှည်စွာ တည်ရှိနေမည် (outlive) ဖြစ်သည်။ multi-window လုပ်ဆောင်ချက်များ၊ app menu၊ window များအကြား tab ဆွဲရွှေ့ခြင်း၊ foreground-process poller၊ mode-2026 strip နှင့် window ပိုင်ဆိုင်မှု စစ်ဆေးထားသော IPC တို့ကို ကိုင်တွယ်သည်။
+- **`preload.js`** — `renderer.js` ကို context-isolated preload world တွင် စတင်ပေးပြီး page main world တွင် Node.js သို့မဟုတ် Electron globals များ မပေးထားပါ။
 - **`renderer.js`** — UI တစ်ခုလုံးဖြစ်သော tab bar၊ split-pane tree၊ settings၊ find၊ links များနှင့် xterm ချိတ်ဆက်မှုအားလုံး (application အလိုက် မြန်မာစာလုံး အကျယ်သတ်မှတ်ပေးသည့် `setupMarkWidth`၊ `paneWantsAllOne` စသည့် logic များ အပါအဝင်) ကို ကိုင်တွယ်သည်။
 - **`index.html`** — markup နှင့် styles များ ဖြစ်သည်။
 - **`patches/patch-xterm-myanmar.js`** — စာလုံးပုံဖော်မှုအတွက် patch ဖြစ်သည် (အထက်တွင် ကြည့်ရန်)။
+- **`lib/`** — stream၊ width selection၊ terminal utility နှင့် IPC validation အတွက် test ပြုလုပ်ထားသော helper များ ဖြစ်သည်။
 
 ကုဒ်အဆင့်အထိ အသေးစိတ်လေ့လာရန် [CLAUDE.md](CLAUDE.md) တွင် ဖတ်ရှုနိုင်ပါသည်။
 

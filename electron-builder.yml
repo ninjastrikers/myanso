@@ -9,7 +9,9 @@ directories:
 # App source + native deps; exclude dev cache
 files:
   - main.js
+  - preload.js
   - renderer.js
+  - lib/**/*
   - index.html
   - patches/**/*
   - node_modules/**/*

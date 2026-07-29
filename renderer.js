@@ -4,8 +4,9 @@ const { Terminal } = require('@xterm/xterm');
 const { FitAddon } = require('@xterm/addon-fit');
 const { SerializeAddon } = require('@xterm/addon-serialize');
 const { SearchAddon } = require('@xterm/addon-search');
-const fs = require('fs');
-const path = require('path');
+const { quoteShellPath, parseOsc7, terminalBasename } = require('./lib/terminal-utils');
+const { isMyanmarMark, isMyanmarNonspacing, appWidthModeForContext } = require('./lib/myanmar-width');
+const { validPtyId, validTabId, validTabDescriptor } = require('./lib/ipc-validation');
 
 // Each window gets a unique id (passed by main via additionalArguments) so two
 // windows never generate the same pty/tab id. Tells main this renderer is ready
@@ -22,17 +23,6 @@ const IS_LINUX = process.platform === 'linux';
 // terminal and mid-line edits then clobber the marks (မြန်မာ → မနမ). macOS keeps
 // 'myan-shell' to match its zero-width spacing marks.
 const NORMAL_SCREEN_VERSION = IS_LINUX ? 'myan-std' : 'myan-shell';
-
-// Quote a file path for the current shell so it can be pasted safely.
-// PowerShell uses single quotes with '' for embedded single quotes;
-// POSIX shells use '\'' (close-quote, escaped quote, re-open quote).
-function quoteShellPath(p) {
-  if (IS_WIN) {
-    // PowerShell: wrap in single quotes; double any embedded single quotes.
-    return `'${p.replace(/'/g, "''")}'`;
-  }
-  return `'${p.replace(/'/g, `'\\''`)}'`;
-}
 
 // A Myanmar-capable fallback list is always appended so the whole cluster is
 // shaped by one font instead of per-glyph fallbacks.
@@ -634,27 +624,11 @@ function renderPreview() {
 //
 // isMyanmarMark = the full Myanmar mark range (mirrors MARK() in the xterm patch);
 // isMyanmarNonspacing = just the Mn (non-spacing) subset.
-function isMyanmarMark(c) {
-  return (c >= 0x102b && c <= 0x103e) || (c >= 0x1056 && c <= 0x1059) ||
-    (c >= 0x105e && c <= 0x1060) || (c >= 0x1062 && c <= 0x1064) ||
-    (c >= 0x1067 && c <= 0x106d) || (c >= 0x1071 && c <= 0x1074) ||
-    (c >= 0x1082 && c <= 0x108d) || c === 0x108f ||
-    (c >= 0x109a && c <= 0x109d);
-}
-
 // Myanmar non-spacing marks (general category Mn) — width 0 in standard wcwidth.
 // Everything else in the Myanmar block (incl. spacing marks Mc like ◌ာ ◌း ◌ြ) is
 // width 1. NOTE: xterm's stock '6' table gets several of these wrong (it gives
 // the asat ◌် U+103A, the medials ◌ွ ◌ှ, and others width 1), which desyncs every
 // ◌်-ending syllable — hence this explicit Mn list instead of trusting base.
-function isMyanmarNonspacing(c) {
-  return (c >= 0x102d && c <= 0x1030) || (c >= 0x1032 && c <= 0x1037) ||
-    c === 0x1039 || c === 0x103a || c === 0x103d || c === 0x103e ||
-    (c >= 0x1058 && c <= 0x1059) || (c >= 0x105e && c <= 0x1060) ||
-    (c >= 0x1071 && c <= 0x1074) || c === 0x1082 ||
-    (c >= 0x1085 && c <= 0x1086) || c === 0x108d || c === 0x109d;
-}
-
 // Pack a width into xterm's charProperties value, joining a width-0 mark onto the
 // preceding cell (so it shapes as one cluster). Mirrors xterm's default packing.
 function packMyanProps(width, preceding) {
@@ -725,28 +699,20 @@ function setupMarkWidth(term) {
 //      sets process.title to the version), or "claude".
 // A plain shell in the foreground means no TUI is running, so we never force then
 // — this also stops a *stale* "Claude Code" title from sticking after you quit it.
-const ALL_ONE_NAMES = ['claude'];           // foreground process name substrings → myan-allone
-const ALL_ONE_TITLE = /claude/i;           // OSC terminal title → myan-allone
-const STD_MODE_NAMES = ['codex'];          // foreground process names → myan-std even on normal screen
-const SEMVER_FG = /^\d+\.\d+\.\d+/;        // Claude Code's process.title (version)
-const SHELL_FG = /^-?(zsh|bash|fish|dash|sh|ksh|tcsh|csh|pwsh|powershell)(\.exe)?$/;
-function isShellFg(name) {
-  const fg = String(name || '').split(/[\\/]/).pop().toLowerCase();
-  const configured = String(process.env.SHELL || '').split(/[\\/]/).pop().toLowerCase();
-  return SHELL_FG.test(fg) || (!!configured && fg.replace(/^-/, '') === configured.replace(/^-/, ''));
-}
-
 function paneWantsAllOne(pane) {
-  const fg = (pane._fgProcess || '').toLowerCase();
-  if (fg === '' || isShellFg(fg)) return false;    // plain shell: no TUI running
-  if (SEMVER_FG.test(fg) || ALL_ONE_NAMES.some((a) => fg.includes(a))) return true;
-  return ALL_ONE_TITLE.test(pane.title || '');         // fall back to the app's title
+  return appWidthModeForContext({
+    foreground: pane._fgProcess,
+    title: pane.title,
+    configuredShell: process.env.SHELL
+  }) === 'myan-allone';
 }
 
 function paneWantsStd(pane) {
-  const fg = (pane._fgProcess || '').toLowerCase();
-  if (fg === '' || isShellFg(fg)) return false;
-  return STD_MODE_NAMES.some((a) => fg.includes(a));
+  return appWidthModeForContext({
+    foreground: pane._fgProcess,
+    title: pane.title,
+    configuredShell: process.env.SHELL
+  }) === 'myan-std';
 }
 
 // Closing a pane/tab asks first when a non-shell program is still running in it
@@ -916,14 +882,14 @@ function createPane(tabId, cwd, reattach) {
     setActivePane(pane);
     // Use term.paste so xterm emits bracketed-paste markers — TUIs like Claude
     // Code then treat it as pasted text instead of typed input.
-    pane.term.paste(' ' + quoteShellPath(fpath));
+    pane.term.paste(' ' + quoteShellPath(fpath, process.platform));
   });
 
   // Shell title via OSC 0 (icon+title) / OSC 2 (title) — xterm parses both.
   term.onTitleChange((title) => { pane.title = title; onPaneTitleChanged(pane); updatePaneMarkWidth(pane); });
   // Working directory via OSC 7 (file://host/path) for the title fallback.
   term.parser.registerOscHandler(7, (data) => {
-    pane.cwd = parseOsc7(data);
+    pane.cwd = parseOsc7(data, process.platform);
     onPaneTitleChanged(pane);
     return true;
   });
@@ -937,18 +903,8 @@ function createPane(tabId, cwd, reattach) {
   return pane;
 }
 
-// Use fileURLToPath so Windows drive-letter URIs (file:///C:/x) decode to the
-// native path (C:\x) correctly. Falls back to manual URL parsing if it fails.
-function parseOsc7(data) {
-  try { return fileURLToPath(data); } catch (e) {
-    try { return decodeURIComponent(new URL(data).pathname); } catch (_) { return ''; }
-  }
-}
 function basename(p) {
-  if (!p) return '';
-  // Handle both POSIX (/) and Windows (\) path separators.
-  const parts = p.replace(/[/\\]+$/, '').split(/[/\\]/);
-  return parts[parts.length - 1] || (IS_WIN ? '' : '/');
+  return terminalBasename(p, process.platform);
 }
 
 // --- Flow control ------------------------------------------------------------
@@ -1709,7 +1665,9 @@ function renderTabBar() {
 
 // --- Global pty + menu wiring ----------------------------------------------
 
-ipcRenderer.on('pty-data', (event, { id, data }) => {
+ipcRenderer.on('pty-data', (event, payload) => {
+  if (!payload || !validPtyId(payload.id) || typeof payload.data !== 'string') return;
+  const { id, data } = payload;
   const pane = panesByPtyId.get(id);
   if (pane && pane.opened) {
     writeToPane(pane, data);
@@ -1732,25 +1690,35 @@ ipcRenderer.on('pty-data', (event, { id, data }) => {
     }
   }
 });
-ipcRenderer.on('pty-exit', (event, { id }) => {
+ipcRenderer.on('pty-exit', (event, payload) => {
+  if (!payload || !validPtyId(payload.id)) return;
+  const { id } = payload;
   pendingData.delete(id);
   const pane = panesByPtyId.get(id);
   if (pane) closePane(pane);
 });
 // Main reports the directory actually used to launch the shell. This fills the
 // OSC 7 gap on Linux and keeps subsequent tab titles/inheritance up to date.
-ipcRenderer.on('pty-cwd', (event, { id, cwd }) => {
+ipcRenderer.on('pty-cwd', (event, payload) => {
+  if (!payload || !validPtyId(payload.id) || typeof payload.cwd !== 'string') return;
+  const { id, cwd } = payload;
   const pane = panesByPtyId.get(id);
   if (pane && cwd) { pane.cwd = cwd; onPaneTitleChanged(pane); }
 });
 // Foreground app changed in this pty — pick the Myanmar mark width it expects.
-ipcRenderer.on('pty-process', (event, { id, name }) => {
+ipcRenderer.on('pty-process', (event, payload) => {
+  if (!payload || !validPtyId(payload.id) || typeof payload.name !== 'string') return;
+  const { id, name } = payload;
   const pane = panesByPtyId.get(id);
   if (pane) { pane._fgProcess = name; updatePaneMarkWidth(pane); }
 });
 
-ipcRenderer.on('adopt-tab', (event, { descriptor }) => adoptTab(descriptor));
-ipcRenderer.on('tab-drag-serialize', (event, { tabId }) => {
+ipcRenderer.on('adopt-tab', (event, payload) => {
+  if (payload && validTabDescriptor(payload.descriptor)) adoptTab(payload.descriptor);
+});
+ipcRenderer.on('tab-drag-serialize', (event, payload) => {
+  if (!payload || !validTabId(payload.tabId)) return;
+  const { tabId } = payload;
   const tab = tabs.find((t) => t.id === tabId);
   if (!tab) return;
   ipcRenderer.send('tab-drag-serialized', {
@@ -1758,9 +1726,13 @@ ipcRenderer.on('tab-drag-serialize', (event, { tabId }) => {
     descriptor: buildTabDescriptor(tab)
   });
 });
-ipcRenderer.on('remove-tab', (event, { tabId }) => removeTabKeepPtys(tabId));
-ipcRenderer.on('tab-drag-over', (event, { active }) => {
-  document.getElementById('tabbar').classList.toggle('drop-target', active);
+ipcRenderer.on('remove-tab', (event, payload) => {
+  if (payload && validTabId(payload.tabId)) removeTabKeepPtys(payload.tabId);
+});
+ipcRenderer.on('tab-drag-over', (event, payload) => {
+  if (payload && typeof payload.active === 'boolean') {
+    document.getElementById('tabbar').classList.toggle('drop-target', payload.active);
+  }
 });
 
 // --- Pane right-click context menu ------------------------------------------
@@ -1953,7 +1925,9 @@ window.addEventListener('resize', () => hidePaneMenu());
 window.addEventListener('keydown', (e) => { if (e.key === 'Escape') hidePaneMenu(); });
 
 ipcRenderer.on('new-tab', () => newTab());
-ipcRenderer.on('open-folder', (event, { path }) => newTab(path));
+ipcRenderer.on('open-folder', (event, payload) => {
+  if (payload && typeof payload.path === 'string' && payload.path.length <= 8192) newTab(payload.path);
+});
 ipcRenderer.on('close-pane', () => { if (activePane) requestClosePane(activePane); });
 ipcRenderer.on('split-right', () => splitActive('row'));
 ipcRenderer.on('split-down', () => splitActive('col'));

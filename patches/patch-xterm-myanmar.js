@@ -90,26 +90,49 @@ const targets = [
   },
 ];
 
-let ok = 0;
-for (const t of targets) {
-  const p = path.join(base, t.name);
-  if (!file.existsSync(p)) {
-    console.error(`[patch-xterm] missing ${p} — is @xterm/xterm installed?`);
-    process.exit(1);
+function applyPatch(baseDirectory = base, log = console.log) {
+  const files = new Map();
+  const statuses = [];
+
+  // Validate and stage every replacement in memory before writing either file.
+  // A minifier mismatch therefore cannot leave node_modules half-patched.
+  for (const t of targets) {
+    const p = path.join(baseDirectory, t.name);
+    let state = files.get(p);
+    if (!state) {
+      if (!file.existsSync(p)) {
+        throw new Error(`[patch-xterm] missing ${p} — is @xterm/xterm installed?`);
+      }
+      const src = file.readFileSync(p, 'utf8');
+      state = { original: src, staged: src };
+      files.set(p, state);
+    }
+    if (state.staged.includes(t.replace)) {
+      statuses.push({ name: t.name, status: 'already patched' });
+      continue;
+    }
+    if (!state.staged.includes(t.find)) {
+      throw new Error(`[patch-xterm] ${t.name}: target not found — xterm version changed? Expected v6.0.0`);
+    }
+    state.staged = state.staged.replace(t.find, t.replace);
+    statuses.push({ name: t.name, status: 'patched ✔' });
   }
-  let src = file.readFileSync(p, 'utf8');
-  if (src.includes(t.replace)) {
-    console.log(`[patch-xterm] ${t.name}: already patched`);
-    ok++;
-    continue;
+
+  for (const [p, state] of files) {
+    if (state.staged !== state.original) file.writeFileSync(p, state.staged);
   }
-  if (!src.includes(t.find)) {
-    console.error(`[patch-xterm] ${t.name}: target not found — xterm version changed? Expected v6.0.0`);
-    process.exit(1);
-  }
-  src = src.replace(t.find, t.replace);
-  file.writeFileSync(p, src);
-  console.log(`[patch-xterm] ${t.name}: patched ✔`);
-  ok++;
+  for (const item of statuses) log(`[patch-xterm] ${item.name}: ${item.status}`);
+  log(`[patch-xterm] done (${statuses.length}/${targets.length})`);
+  return statuses.length;
 }
-console.log(`[patch-xterm] done (${ok}/${targets.length})`);
+
+if (require.main === module) {
+  try {
+    applyPatch();
+  } catch (error) {
+    console.error(error.message);
+    process.exitCode = 1;
+  }
+}
+
+module.exports = { applyPatch, targets };
