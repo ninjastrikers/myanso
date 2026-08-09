@@ -73,13 +73,84 @@ jobs:
       - name: Run checks
         run: npm run check
 
-      - name: Package with electron-builder
+      - name: Prepare macOS signing and notarization credentials
+        if: matrix.platform.runner == 'macos-14'
+        env:
+          MAC_CSC_LINK: ${{ secrets.MAC_CSC_LINK }}
+          MAC_CSC_KEY_PASSWORD: ${{ secrets.MAC_CSC_KEY_PASSWORD }}
+          APPLE_API_KEY_CONTENT: ${{ secrets.APPLE_API_KEY }}
+          APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          set -euo pipefail
+
+          for required in MAC_CSC_LINK MAC_CSC_KEY_PASSWORD APPLE_API_KEY_CONTENT APPLE_API_KEY_ID APPLE_API_ISSUER APPLE_TEAM_ID; do
+            if [[ -z "${!required:-}" ]]; then
+              echo "Missing required GitHub secret: ${required/CONTENT/}" >&2
+              exit 1
+            fi
+          done
+
+          key_path="$RUNNER_TEMP/AuthKey_${APPLE_API_KEY_ID}.p8"
+          if [[ "$APPLE_API_KEY_CONTENT" == *"-----BEGIN PRIVATE KEY-----"* ]]; then
+            printf '%s\n' "$APPLE_API_KEY_CONTENT" > "$key_path"
+          else
+            printf '%s' "$APPLE_API_KEY_CONTENT" | base64 --decode > "$key_path"
+          fi
+          chmod 600 "$key_path"
+
+          {
+            echo "APPLE_API_KEY=$key_path"
+            echo "APPLE_API_KEY_ID=$APPLE_API_KEY_ID"
+            echo "APPLE_API_ISSUER=$APPLE_API_ISSUER"
+          } >> "$GITHUB_ENV"
+
+      - name: Package macOS with signing and notarization
+        if: matrix.platform.runner == 'macos-14'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CSC_LINK: ${{ secrets.MAC_CSC_LINK }}
+          CSC_KEY_PASSWORD: ${{ secrets.MAC_CSC_KEY_PASSWORD }}
+        run: |
+          npx electron-builder ${{ matrix.platform.args }} \
+            -c.mac.hardenedRuntime=true \
+            -c.mac.notarize=true \
+            -c.mac.forceCodeSigning=true \
+            --publish never
+        shell: bash
+
+      - name: Package non-macOS target
+        if: matrix.platform.runner != 'macos-14'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           LINUX_MAINTAINER: ${{ secrets.LINUX_MAINTAINER }}
         run: npx electron-builder ${{ matrix.platform.args }} -c.linux.maintainer="$LINUX_MAINTAINER" --publish never
         shell: bash
+
+      - name: Verify macOS signature and notarization
+        if: matrix.platform.runner == 'macos-14'
+        env:
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          app_path="$(find dist -type d -name 'Myanso.app' -print -quit)"
+          if [[ -z "$app_path" ]]; then
+            echo "Could not find Myanso.app in dist" >&2
+            exit 1
+          fi
+
+          codesign --verify --deep --strict --verbose=2 "$app_path"
+          signing_details="$(codesign --display --verbose=4 "$app_path" 2>&1)"
+          printf '%s\n' "$signing_details"
+          grep -Fq 'Authority=Developer ID Application:' <<< "$signing_details"
+          grep -Fq "TeamIdentifier=$APPLE_TEAM_ID" <<< "$signing_details"
+          spctl --assess --verbose=4 --type exec "$app_path"
+          xcrun stapler validate "$app_path"
 
       - name: Verify expected installers
         shell: bash

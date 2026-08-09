@@ -12,3 +12,5 @@ GEMINI.md
 QWEN.md
 .codex
 .antigravitycli
+*.p12
+*.p8

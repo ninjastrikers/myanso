@@ -22,8 +22,11 @@ files:
 mac:
   category: public.app-category.developer-tools
   icon: icon.png
-  identity: null
+  # electron-builder auto-discovers a certificate supplied through CSC_LINK.
+  # Keep this off for unsigned local builds; release CI overrides it to true.
   hardenedRuntime: false
+  entitlements: build/entitlements.mac.plist
+  entitlementsInherit: build/entitlements.mac.inherit.plist
   gatekeeperAssess: false
   # Lets users drag a folder onto the dock icon — macOS only forwards the
   # drop (open-file) when CFBundleDocumentTypes declares the type.

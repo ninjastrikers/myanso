@@ -139,12 +139,8 @@ text in the shell, in vim, and in a TUI like Claude Code, Codex CLI, or agy.
 
 Grab the latest build from the [Releases](../../releases) page.
 
-**macOS** (unsigned): drag `Myanso.app` to `/Applications`, then clear the
-quarantine flag:
-
-```bash
-xattr -d com.apple.quarantine /Applications/Myanso.app
-```
+**macOS**: download the notarized DMG, open it, and drag `Myanso.app` to
+`/Applications`. No `xattr` command is required.
 
 ## Development
 

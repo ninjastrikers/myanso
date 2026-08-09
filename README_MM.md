@@ -91,11 +91,7 @@ npm run dist         # install လုပ်ပြီး အသုံးပြု
 
 နောက်ဆုံးထွက် build ဖိုင်များကို [Releases](../../releases) စာမျက်နှာတွင် ရယူနိုင်သည်။
 
-**macOS** (unsigned) - `Myanso.app` ကို `/Applications` သို့ drag ဆွဲထည့်ပါ၊ ထို့နောက် quarantine flag ကို ဖျက်ပစ်ပါ -
-
-```bash
-xattr -d com.apple.quarantine /Applications/Myanso.app
-```
+**macOS** - notarize လုပ်ထားသော DMG ကို download လုပ်ပြီး ဖွင့်ပါ၊ ထို့နောက် `Myanso.app` ကို `/Applications` သို့ drag ဆွဲထည့်ပါ။ `xattr` command မလိုအပ်ပါ။
 
 ## ဆော့ဖ်ဝဲရေးသားထုတ်လုပ်ခြင်း (Development)
 
