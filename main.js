@@ -687,10 +687,20 @@ function setDragTarget(win) {
   dragTarget = win;
 }
 
-function endDrag() {
+function sendDragResult(session, outcome) {
+  if (!session || !session.sourceWin || session.sourceWin.isDestroyed()) return;
+  session.sourceWin.webContents.send('tab-drag-result', {
+    tabId: session.descriptor.tabId,
+    outcome
+  });
+}
+
+function endDrag(outcome) {
+  const session = dragging;
   if (dragTimer) { clearInterval(dragTimer); dragTimer = null; }
   setDragTarget(null);
   dragging = null;
+  if (outcome) sendDragResult(session, outcome);
 }
 
 // Scrollback serialization can be expensive for a split tab. Wait until main
@@ -698,12 +708,16 @@ function endDrag() {
 // source renderer for the fresh descriptor. In-window reorders and cancelled
 // drags avoid this work entirely.
 function requestTransferDescriptor(targetWin) {
-  if (!dragging || !targetWin || targetWin.isDestroyed()) { endDrag(); return; }
+  if (!dragging || !targetWin || targetWin.isDestroyed()) { endDrag('cancelled'); return; }
   const { sourceWin, descriptor } = dragging;
-  if (!sourceWin || sourceWin.isDestroyed()) { endDrag(); return; }
+  if (!sourceWin || sourceWin.isDestroyed()) { endDrag('cancelled'); return; }
   if (dragTimer) { clearInterval(dragTimer); dragTimer = null; }
   setDragTarget(null);
   dragging.targetWin = targetWin;
+  if (!dragging.resultSent) {
+    sendDragResult(dragging, 'transferring');
+    dragging.resultSent = true;
+  }
   sourceWin.webContents.send('tab-drag-serialize', { tabId: descriptor.tabId });
 }
 
@@ -862,7 +876,7 @@ function setupIpc() {
     if (!payload || !validTabDescriptor(payload.descriptor) || !validPtyIds(payload.ptyIds) ||
         payload.ptyIds.length !== payload.descriptor.ptyIds.length ||
         !payload.ptyIds.every((id) => payload.descriptor.ptyIds.includes(id) && ownedPty(event, id))) return;
-    endDrag();
+    endDrag('cancelled');
     const sourceWin = senderWindow(event);
     if (!sourceWin) return;
     dragging = { sourceWin, descriptor: payload.descriptor, ptyIds: [...payload.ptyIds] };
@@ -880,7 +894,7 @@ function setupIpc() {
     const sourceId = dragging.sourceWin && dragging.sourceWin.id;
 
     if (target && target.id === sourceId) {
-      endDrag(); // dropped back on its own tab bar → cancel
+      endDrag('reordered'); // in-window reorder is already reflected in the renderer
       return;
     }
     if (target) {
@@ -891,6 +905,10 @@ function setupIpc() {
     // Hold the drag state until the new renderer is ready, then ask the source
     // for scrollback. This avoids serializing before we know a move is needed.
     const held = dragging;
+    if (!dragging.resultSent) {
+      sendDragResult(dragging, 'transferring');
+      dragging.resultSent = true;
+    }
     const win = createWindow({ x: point.x - 40, y: point.y - 10 }, undefined, { noInitialTab: true });
     onceReady(win, () => {
       if (dragging === held) requestTransferDescriptor(win);
@@ -910,9 +928,18 @@ function setupIpc() {
     const sourceWin = senderWindow(event);
     if (!sourceWin || !dragging.sourceWin || sourceWin.id !== dragging.sourceWin.id) return;
     const target = dragging.targetWin;
-    if (!target || target.isDestroyed()) { endDrag(); return; }
+    if (!target || target.isDestroyed()) {
+      if (dragging.resultSent) sendDragResult(dragging, 'cancelled');
+      endDrag();
+      return;
+    }
     dragging.descriptor = descriptor;
-    moveTabToWindow(target);
+    const moved = moveTabToWindow(target);
+    if (!moved) {
+      if (dragging.resultSent) sendDragResult(dragging, 'cancelled');
+      endDrag(dragging.resultSent ? undefined : 'cancelled');
+      return;
+    }
     endDrag();
   });
 }

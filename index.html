@@ -56,12 +56,14 @@
       overflow-x: auto;
       border-radius: 8px;
       scrollbar-width: none;        /* Firefox */
+      transition: box-shadow 0.12s ease, background-color 0.12s ease;
     }
     /* Hide the horizontal scrollbar on the tab bar (still scrollable). */
     #tabbar::-webkit-scrollbar { display: none; }
 
     /* Highlight when a tab is being dragged over this window's bar. */
     #tabbar.drop-target {
+      background: color-mix(in srgb, var(--accent, #4c8bf5) 8%, transparent);
       box-shadow: inset 0 0 0 2px var(--accent, #4c8bf5);
     }
 
@@ -70,7 +72,9 @@
       position: fixed;
       z-index: 1000;
       pointer-events: none;
-      transform: translate(8px, 8px);
+      top: 0;
+      left: 0;
+      transform: translate3d(-1000px, -1000px, 0);
       padding: 3px 10px;
       border-radius: 6px;
       background: var(--tab-bg-active, #15171e);
@@ -79,6 +83,18 @@
       font: 12px -apple-system, "Segoe UI", sans-serif;
       white-space: nowrap;
       opacity: 0.9;
+      will-change: transform, opacity;
+      box-shadow: 0 5px 18px rgba(0, 0, 0, 0.24);
+    }
+
+    .tab-drag-ghost.colored {
+      border-bottom-color: var(--tab-color);
+      box-shadow: inset 0 -2px 0 var(--tab-color), 0 5px 18px rgba(0, 0, 0, 0.24);
+    }
+
+    .tab-drag-ghost.ending {
+      opacity: 0;
+      transition: opacity 0.12s ease;
     }
 
     .tab {
@@ -100,6 +116,41 @@
       flex: 0 1 auto;
       min-width: 72px;
       max-width: 200px;
+      will-change: transform;
+    }
+
+    .tab.drag-source {
+      opacity: 0.28;
+    }
+
+    .tab.transfer-pending {
+      opacity: 0.42;
+    }
+
+    .tab.drag-settling {
+      animation: tab-settle 0.12s ease-out;
+    }
+
+    @keyframes tab-settle {
+      from {
+        opacity: 0.45;
+        transform: translate3d(0, -2px, 0);
+      }
+      to {
+        opacity: 1;
+        transform: translate3d(0, 0, 0);
+      }
+    }
+
+    @media (prefers-reduced-motion: reduce) {
+      #tabbar,
+      .tab-drag-ghost {
+        transition-duration: 0s;
+      }
+
+      .tab.drag-settling {
+        animation: none;
+      }
     }
 
     /* Let the title truncate with … instead of forcing the tab wider, and grow to

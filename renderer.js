@@ -5,8 +5,9 @@ const { FitAddon } = require('@xterm/addon-fit');
 const { SerializeAddon } = require('@xterm/addon-serialize');
 const { SearchAddon } = require('@xterm/addon-search');
 const { quoteShellPath, parseOsc7, terminalBasename } = require('./lib/terminal-utils');
+const { insertionIndex, edgeScrollVelocity } = require('./lib/tab-drag');
 const { isMyanmarMark, isMyanmarNonspacing, appWidthModeForContext } = require('./lib/myanmar-width');
-const { validPtyId, validTabId, validTabDescriptor } = require('./lib/ipc-validation');
+const { validPtyId, validTabId, validTabDescriptor, validTabDragResult } = require('./lib/ipc-validation');
 
 // Each window gets a unique id (passed by main via additionalArguments) so two
 // windows never generate the same pty/tab id. Tells main this renderer is ready
@@ -777,6 +778,7 @@ const pendingData = new Map();
 const tabs = [];                  // ordered list of open tabs
 let currentTab = null;
 let activePane = null;
+let activeTabDrag = null;
 let counter = 0;
 const nextId = (p) => p + '_' + WID + '_' + (++counter);
 
@@ -1499,6 +1501,17 @@ function rebuildTree(descNode, tabId) {
   };
 }
 
+function animateAdoptedTab(tab) {
+  if (!tab.btnEl || reducedMotion()) return;
+  tab.btnEl.animate([
+    { opacity: 0.35, transform: 'translate3d(0, -4px, 0)' },
+    { opacity: 1, transform: 'translate3d(0, 0, 0)' }
+  ], {
+    duration: TAB_ARRIVAL_MS,
+    easing: 'cubic-bezier(0.2, 0.8, 0.2, 1)'
+  });
+}
+
 // Build a tab in THIS window from a descriptor moved in from another window.
 function adoptTab(descriptor) {
   const tab = { id: nextId('tab'), el: document.createElement('div'), root: null, activePtyId: null, customTitle: descriptor.customTitle || undefined, color: descriptor.color || undefined };
@@ -1510,6 +1523,7 @@ function adoptTab(descriptor) {
   tabs.push(tab);
   renderTabBar();
   renderTab(tab);
+  animateAdoptedTab(tab);
   selectTab(tab);
   if (first) focusPane(first);
   // Ack with the SOURCE tab id so main can now tell the source to remove it.
@@ -1530,84 +1544,215 @@ function removeTabKeepPtys(tabId) {
   if (currentTab === tab) selectTab(tabs[Math.min(idx, tabs.length - 1)]);
 }
 
-// While dragging, if the cursor is over this window's tab bar, reorder `tabs`
-// live (iTerm-style) so the dragged tab slides to the slot under the cursor.
-// Cross-window moves are still handled by main on release; this only rearranges
-// within the current window.
+const TAB_REORDER_MS = 150;
+const TAB_SETTLE_MS = 120;
+const TAB_ARRIVAL_MS = 140;
+const TAB_DRAG_RESULT_TIMEOUT_MS = 1000;
+
+function reducedMotion() {
+  return window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+}
+
+function setTabDragState(tab, state) {
+  tab.dragState = state || undefined;
+  if (!tab.btnEl) return;
+  tab.btnEl.classList.toggle('drag-source', state === 'dragging');
+  tab.btnEl.classList.toggle('transfer-pending', state === 'transferring');
+}
+
+function tabLayoutMidpoint(bar, tab) {
+  const rect = bar.getBoundingClientRect();
+  return rect.left + tab.btnEl.offsetLeft - bar.scrollLeft + tab.btnEl.offsetWidth / 2;
+}
+
+function animateTabReorder(sourceTab, mutate) {
+  const elements = tabs.map((tab) => tab.btnEl).filter(Boolean);
+  const before = new Map(elements.map((el) => [el, el.getBoundingClientRect().left]));
+  const session = activeTabDrag;
+
+  // An interrupted animation must be rebased from its current visual position.
+  // Cancelling after the measurements makes the next FLIP delta continuous.
+  if (session) {
+    for (const animation of session.animations.values()) animation.cancel();
+    session.animations.clear();
+  }
+
+  mutate();
+  if (reducedMotion() || !session) return;
+
+  for (const element of elements) {
+    if (element === sourceTab.btnEl) continue;
+    const previousLeft = before.get(element);
+    const finalLeft = element.getBoundingClientRect().left;
+    const delta = previousLeft - finalLeft;
+    if (Math.abs(delta) < 0.5) continue;
+
+    const animation = element.animate([
+      { transform: `translate3d(${delta}px, 0, 0)` },
+      { transform: 'translate3d(0, 0, 0)' }
+    ], {
+      duration: TAB_REORDER_MS,
+      easing: 'cubic-bezier(0.2, 0.8, 0.2, 1)'
+    });
+    session.animations.set(element, animation);
+    animation.finished.catch(() => {}).finally(() => {
+      if (session.animations.get(element) === animation) session.animations.delete(element);
+    });
+  }
+}
+
+// While dragging, reorder `tabs` live so the tab peers glide into their new
+// slots. Cross-window moves are still decided by main on release.
 function reorderTabUnderCursor(tab, x, y) {
   const bar = document.getElementById('tabbar');
-  const r = bar.getBoundingClientRect();
-  // Only reorder while the cursor is within the tab bar band.
-  if (y < r.top || y > r.bottom) return;
+  const rect = bar.getBoundingClientRect();
+  if (y < rect.top || y > rect.bottom) return false;
+
   const from = tabs.indexOf(tab);
-  if (from === -1) return;
-  // Find the insertion index by comparing x against each tab button's midpoint.
-  let to = tabs.length - 1;
-  for (let i = 0; i < tabs.length; i++) {
-    const el = tabs[i].btnEl;
-    if (!el) continue;
-    const b = el.getBoundingClientRect();
-    if (x < b.left + b.width / 2) { to = i; break; }
+  if (from === -1) return false;
+
+  // Excluding the source makes the destination an index in the final array.
+  // This permits moving the first tab all the way after the final tab.
+  const peers = tabs.filter((candidate) => candidate !== tab);
+  const midpoints = peers.map((candidate) => tabLayoutMidpoint(bar, candidate));
+  const destination = insertionIndex(midpoints, x);
+  if (destination === from) return false;
+
+  animateTabReorder(tab, () => {
+    tabs.splice(from, 1);
+    tabs.splice(destination, 0, tab);
+    const next = tabs[destination + 1];
+    bar.insertBefore(tab.btnEl, next ? next.btnEl : null);
+  });
+  return true;
+}
+
+function fadeAndRemoveDragGhost(session) {
+  const ghost = session && session.ghost;
+  if (!ghost || !ghost.isConnected) return;
+  ghost.classList.add('ending');
+  const delay = reducedMotion() ? 0 : TAB_SETTLE_MS;
+  setTimeout(() => {
+    if (ghost.isConnected) ghost.remove();
+  }, delay);
+}
+
+function finishLocalTabDrag(tab, outcome) {
+  const session = activeTabDrag && activeTabDrag.tab === tab ? activeTabDrag : null;
+  if (session) {
+    if (session.removeListeners) session.removeListeners();
+    if (session.resultTimer) clearTimeout(session.resultTimer);
+    if (session.frame) cancelAnimationFrame(session.frame);
+    for (const animation of session.animations.values()) animation.cancel();
+    session.animations.clear();
+    fadeAndRemoveDragGhost(session);
   }
-  if (to === from) return;
-  tabs.splice(from, 1);
-  // After removing `from`, indices past it shift left by one, so a rightward
-  // move must target `to - 1` to land in the intended slot.
-  const destination = to > from ? to - 1 : to;
-  tabs.splice(destination, 0, tab);
-  // The tab buttons are stable while dragging, so move only this DOM node
-  // instead of rebuilding every tab and every event listener on each slot hop.
-  const next = tabs[destination + 1];
-  bar.insertBefore(tab.btnEl, next ? next.btnEl : null);
+
+  document.body.classList.remove('tab-dragging');
+
+  if (outcome === 'transferring') {
+    setTabDragState(tab, 'transferring');
+  } else {
+    setTabDragState(tab, undefined);
+    if (tab.btnEl) {
+      tab.btnEl.classList.add('drag-settling');
+      setTimeout(() => tab.btnEl?.classList.remove('drag-settling'), reducedMotion() ? 0 : TAB_SETTLE_MS);
+    }
+  }
+
+  if (session && activeTabDrag === session) activeTabDrag = null;
+}
+
+function scheduleTabDragFrame(session) {
+  if (session.frame) return;
+  session.frame = requestAnimationFrame(() => {
+    session.frame = null;
+    if (!session.started || session.released || activeTabDrag !== session) return;
+
+    const { x, y } = session.pointer;
+    session.ghost.style.transform = `translate3d(${x + 8}px, ${y + 8}px, 0)`;
+
+    const bar = document.getElementById('tabbar');
+    const rect = bar.getBoundingClientRect();
+    const overBar = y >= rect.top && y <= rect.bottom;
+    const velocity = overBar ? edgeScrollVelocity(x, rect.left, rect.right) : 0;
+    const oldScrollLeft = bar.scrollLeft;
+    if (velocity) bar.scrollLeft += velocity;
+    reorderTabUnderCursor(session.tab, x, y);
+
+    // Keep scrolling while the pointer is stationary at an edge.
+    if (velocity && bar.scrollLeft !== oldScrollLeft) scheduleTabDragFrame(session);
+  });
 }
 
 // Start a custom drag when a tab is pressed and the cursor moves past a small
-// threshold. Cross-window routing is decided by main (screen coordinates); here
-// we just announce the drag, follow the cursor with a ghost, and signal release.
+// threshold. The compact ghost stays in this renderer; main handles screen
+// coordinates for cross-window and tear-off moves.
 function startTabDrag(tab, downEvent) {
-  const startX = downEvent.clientX, startY = downEvent.clientY;
-  let active = false;
-  let ghost = null;
-  let reorderFrame = null;
-  let reorderPoint = null;
-
-  const scheduleReorder = (x, y) => {
-    reorderPoint = { x, y };
-    if (reorderFrame) return;
-    reorderFrame = requestAnimationFrame(() => {
-      reorderFrame = null;
-      if (reorderPoint) reorderTabUnderCursor(tab, reorderPoint.x, reorderPoint.y);
-    });
+  const startX = downEvent.clientX;
+  const startY = downEvent.clientY;
+  const session = {
+    tab,
+    started: false,
+    released: false,
+    ghost: null,
+    pointer: { x: startX, y: startY },
+    frame: null,
+    animations: new Map(),
+    resultTimer: null,
+    removeListeners: null
   };
 
-  const onMove = (e) => {
-    if (!active) {
-      if (Math.abs(e.clientX - startX) + Math.abs(e.clientY - startY) < 6) return;
-      active = true;
-      // The main process only needs identity and pty ids while tracking the
-      // drag. Avoid synchronously serializing scrollback until a real drop.
+  if (activeTabDrag) finishLocalTabDrag(activeTabDrag.tab, 'cancelled');
+  activeTabDrag = session;
+
+  const onMove = (event) => {
+    session.pointer = { x: event.clientX, y: event.clientY };
+    if (!session.started) {
+      if (Math.abs(event.clientX - startX) + Math.abs(event.clientY - startY) < 6) return;
+      session.started = true;
+      setTabDragState(tab, 'dragging');
+
+      // Main only needs identity and pty ids until it confirms a cross-window
+      // drop; scrollback serialization remains deferred until then.
       const descriptor = buildTabDescriptor(tab, false);
       ipcRenderer.send('tab-drag-start', { descriptor, ptyIds: descriptor.ptyIds });
-      ghost = document.createElement('div');
+
+      const ghost = document.createElement('div');
       ghost.className = 'tab-drag-ghost';
       ghost.textContent = tabDisplayName(tab);
+      if (tab.color) {
+        ghost.classList.add('colored');
+        ghost.style.setProperty('--tab-color', tab.color);
+      }
       document.body.appendChild(ghost);
+      session.ghost = ghost;
     }
-    ghost.style.left = e.clientX + 'px';
-    ghost.style.top = e.clientY + 'px';
-    scheduleReorder(e.clientX, e.clientY);
+    scheduleTabDragFrame(session);
   };
+
   const onUp = () => {
     document.removeEventListener('mousemove', onMove);
     document.removeEventListener('mouseup', onUp);
-    if (reorderFrame) cancelAnimationFrame(reorderFrame);
-    if (ghost) ghost.remove();
-    if (active) {
-      // Main first determines whether this is actually a cross-window move.
-      // That avoids synchronously serializing every pane's scrollback for a
-      // cancelled drag or an in-window reorder.
-      ipcRenderer.send('tab-drag-end');
+    session.removeListeners = null;
+    session.released = true;
+    if (session.frame) cancelAnimationFrame(session.frame);
+    if (!session.started) {
+      if (activeTabDrag === session) activeTabDrag = null;
+      return;
     }
+
+    // Main determines whether this is an in-window reorder, another window,
+    // or a tear-off. Keep the ghost frozen until that outcome is known.
+    ipcRenderer.send('tab-drag-end');
+    session.resultTimer = setTimeout(() => {
+      if (activeTabDrag === session) finishLocalTabDrag(tab, 'cancelled');
+    }, TAB_DRAG_RESULT_TIMEOUT_MS);
+  };
+
+  session.removeListeners = () => {
+    document.removeEventListener('mousemove', onMove);
+    document.removeEventListener('mouseup', onUp);
   };
   document.addEventListener('mousemove', onMove);
   document.addEventListener('mouseup', onUp);
@@ -1619,7 +1764,9 @@ function renderTabBar() {
   bar.innerHTML = '';
   tabs.forEach((tab) => {
     const el = document.createElement('div');
-    el.className = 'tab' + (tab === currentTab ? ' active' : '');
+    const stateClass = tab.dragState === 'dragging' ? ' drag-source'
+      : tab.dragState === 'transferring' ? ' transfer-pending' : '';
+    el.className = 'tab' + (tab === currentTab ? ' active' : '') + stateClass;
 
     const label = document.createElement('span');
     label.textContent = tabDisplayName(tab);
@@ -1725,6 +1872,12 @@ ipcRenderer.on('tab-drag-serialize', (event, payload) => {
     tabId,
     descriptor: buildTabDescriptor(tab)
   });
+});
+ipcRenderer.on('tab-drag-result', (event, payload) => {
+  if (!validTabDragResult(payload)) return;
+  const tab = tabs.find((candidate) => candidate.id === payload.tabId);
+  if (!tab) return;
+  finishLocalTabDrag(tab, payload.outcome);
 });
 ipcRenderer.on('remove-tab', (event, payload) => {
   if (payload && validTabId(payload.tabId)) removeTabKeepPtys(payload.tabId);

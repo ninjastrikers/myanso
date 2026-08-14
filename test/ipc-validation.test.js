@@ -51,3 +51,12 @@ test('validates bounded unique close requests', () => {
   assert.equal(v.validCloseRequest({ ptyIds: ['pty_1_1', 'pty_1_1'] }), false);
   assert.equal(v.validCloseRequest({ ptyIds: 'pty_1_1' }), false);
 });
+
+test('validates tab drag outcomes', () => {
+  for (const outcome of ['reordered', 'transferring', 'cancelled']) {
+    assert.equal(v.validTabDragResult({ tabId: 'tab_1_1', outcome }), true);
+  }
+  assert.equal(v.validTabDragResult({ tabId: 'tab_1_1', outcome: 'unknown' }), false);
+  assert.equal(v.validTabDragResult({ tabId: '../tab_1_1', outcome: 'cancelled' }), false);
+  assert.equal(v.validTabDragResult(['tab_1_1', 'cancelled']), false);
+});
